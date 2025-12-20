@@ -25,16 +25,13 @@
 """
 from __future__ import with_statement
 
-# Re-exportar desde el módulo refactorizado para mantener compatibilidad hacia atrás
-from htmldiff2.differ import (
-    StreamDiffer,
-    diff_genshi_stream,
-    render_html_diff,
-)
-from htmldiff2.parser import parse_html, longzip
-from htmldiff2.config import DiffConfig
+# Importar API pública para mantener compatibilidad
+from .parser import parse_html, longzip
+from .differ import StreamDiffer, diff_genshi_stream, render_html_diff
+from .config import DiffConfig
 
-# Mantener compatibilidad: exportar todo lo que se exportaba antes
+# Exportar SOLO la API pública (mantener compatibilidad con código existente)
+# No exportar módulos internos para evitar contaminar el namespace
 __all__ = [
     'render_html_diff',
     'parse_html',
@@ -43,3 +40,8 @@ __all__ = [
     'StreamDiffer',
     'longzip',
 ]
+
+# Asegurar que los módulos internos no sean accesibles directamente
+# (aunque Python los expone por defecto, esto documenta la intención)
+
+

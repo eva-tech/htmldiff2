@@ -1,0 +1,1119 @@
+# -*- coding: utf-8 -*-
+"""
+Clases principales para realizar diffs de streams de Genshi.
+"""
+from __future__ import with_statement
+
+import re
+from difflib import SequenceMatcher
+from itertools import chain
+from contextlib import contextmanager
+from genshi.core import Stream, QName, Attrs, START, END, TEXT
+
+from .config import DiffConfig, _leading_space_re, _diff_split_re, _token_split_re, INLINE_FORMATTING_TAGS, BLOCK_WRAPPER_TAGS
+from .utils import (
+    qname_localname, collapse_ws, strip_edge_whitespace_events,
+    extract_text_from_events, raw_text_from_events, concat_events,
+    longest_common_prefix_len, longest_common_suffix_len,
+    has_visual_attrs, attrs_signature, structure_signature,
+    merge_adjacent_change_tags
+)
+from .atomization import atomize_events
+from .normalization import (
+    normalize_opcodes_for_delete_first,
+    normalize_inline_wrapper_opcodes,
+    normalize_inline_wrapper_tag_change_opcodes,
+    should_force_visual_replace
+)
+from .parser import longzip
+
+
+def diff_genshi_stream(old_stream, new_stream):
+    """Renders a creole diff for two texts."""
+    differ = StreamDiffer(old_stream, new_stream)
+    return differ.get_diff_stream()
+
+
+def render_html_diff(old, new, wrapper_element='div', wrapper_class='diff'):
+    """Renders the diff between two HTML fragments."""
+    from .parser import parse_html
+    old_stream = parse_html(old, wrapper_element, wrapper_class)
+    new_stream = parse_html(new, wrapper_element, wrapper_class)
+    rv = diff_genshi_stream(old_stream, new_stream)
+    return rv.render('html', encoding=None)
+
+
+class StreamDiffer(object):
+    """A class that can diff a stream of Genshi events. It will inject
+``<ins>`` and ``<del>`` tags into the stream. It probably breaks
+in very ugly ways if you pass a random Genshi stream to it. I'm
+not exactly sure if it's correct what creoleparser is doing here,
+but it appears that it's not using a namespace. That's fine with me
+so the tags the `StreamDiffer` adds are also unnamespaced.
+"""
+
+    def __init__(self, old_stream, new_stream, config=None):
+        self.config = config or DiffConfig()
+        self._old_events = list(old_stream)
+        self._new_events = list(new_stream)
+        # Atomize for better list/table alignment + text granularity.
+        self._old_atoms = atomize_events(self._old_events, self.config)
+        self._new_atoms = atomize_events(self._new_events, self.config)
+        self._result = None
+        self._stack = []
+        self._context = None
+        self._skip_end_for = []  # used for suppressing void tags on delete (e.g. <br>)
+        self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
+
+    @contextmanager
+    def context(self, kind):
+        old_context = self._context
+        self._context = kind
+        try:
+            yield
+        finally:
+            self._context = old_context
+
+    def inject_class(self, attrs, classname):
+        cls = attrs.get('class')
+        attrs |= [(QName('class'), cls and cls + ' ' + classname or classname)]
+        return attrs
+
+    def inject_refattr(self, attrs, old_attrs):
+        # Track attribute changes (visual + refs). Only inject data-old-* when changed.
+        for attr in getattr(self.config, 'track_attrs', ('style', 'class', 'src', 'href')):
+            old_attr = old_attrs.get(attr)
+            new_attr = attrs.get(attr)
+            if old_attr != new_attr:
+                if new_attr is not None:
+                    attrs |= [(QName(attr), new_attr)]
+                if old_attr is not None:
+                    attrs |= [(QName('data-old-%s' % attr), old_attr)]
+        return attrs
+
+    def append(self, type, data, pos):
+        self._result.append((type, data, pos))
+
+    def text_split(self, text):
+        """
+        Tokenize text for diffing.
+
+        We prefer a tokenizer that separates punctuation (e.g. "CAD" vs "CAD.")
+        so pure punctuation edits become insert/delete instead of replace that
+        accidentally includes adjacent whitespace.
+        """
+        if getattr(self.config, 'tokenize_text', True):
+            rx = getattr(self.config, 'tokenize_regex', _token_split_re)
+            parts = [p for p in rx.split(text) if p != u'']
+            return parts
+        # Legacy behavior: keep words glued to following whitespace
+        worditer = chain([u''], _diff_split_re.split(text))
+        return [x + next(worditer) for x in worditer]
+
+    def cut_leading_space(self, s):
+        match = _leading_space_re.match(s)
+        if match is None:
+            return u'', s
+        return match.group(), s[match.end():]
+
+    def mark_text(self, pos, text, tag):
+        def _make_ws_visible(s):
+            # Convert whitespace that would otherwise be collapsed by HTML into NBSPs,
+            # but keep single mid-string spaces intact for readability.
+            if not s:
+                return s
+            # Leading / trailing spaces: always NBSP
+            s = re.sub(r'^\s+', lambda m: u'\u00a0' * len(m.group(0)), s, flags=re.U)
+            s = re.sub(r'\s+$', lambda m: u'\u00a0' * len(m.group(0)), s, flags=re.U)
+            # Runs of 2+ spaces inside: NBSP for the run
+            s = re.sub(r' {2,}', lambda m: u'\u00a0' * len(m.group(0)), s)
+            return s
+
+        tag = QName(tag)
+        preserve_ws = getattr(self.config, 'preserve_whitespace_in_diff', True) and qname_localname(tag) in ('del', 'ins')
+        if preserve_ws:
+            text = _make_ws_visible(text)
+            self.append(START, (tag, Attrs()), pos)
+            self.append(TEXT, text, pos)
+            self.append(END, tag, pos)
+            return
+
+        ws, text = self.cut_leading_space(text)
+        if ws:
+            self.append(TEXT, ws, pos)
+        self.append(START, (tag, Attrs()), pos)
+        self.append(TEXT, text, pos)
+        self.append(END, tag, pos)
+
+    def diff_text(self, pos, old_text, new_text):
+        old = self.text_split(old_text)
+        new = self.text_split(new_text)
+        matcher = SequenceMatcher(None, old, new)
+
+        def wrap(tag, words):
+            return self.mark_text(pos, u''.join(words), tag)
+
+        # Enforce deterministic delete->insert ordering within each changed region.
+        # SequenceMatcher can produce patterns like delete/insert/delete (e.g. when
+        # a middle token changes), which renders as insertion "inside" deletion.
+        pending_del = []
+        pending_ins = []
+
+        def flush_pending():
+            if pending_del:
+                wrap('del', pending_del)
+                del pending_del[:]
+            if pending_ins:
+                wrap('ins', pending_ins)
+                del pending_ins[:]
+
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                flush_pending()
+                self.append(TEXT, u''.join(old[i1:i2]), pos)
+                continue
+            if tag == 'replace':
+                pending_del.extend(old[i1:i2])
+                pending_ins.extend(new[j1:j2])
+            elif tag == 'delete':
+                pending_del.extend(old[i1:i2])
+            elif tag == 'insert':
+                pending_ins.extend(new[j1:j2])
+            else:
+                pass
+        flush_pending()
+
+    def _handle_replace_special_cases(self, old, new, old_start, old_end, new_start, new_end):
+        """Maneja casos especiales de reemplazo antes del procesamiento general."""
+        # Special-case: one inline wrapper removed/changed while keeping a shared
+        # prefix/suffix. This prevents over-highlighting unchanged prefix text
+        # (e.g. "Texto " in underline_removal) and keeps del->ins ordering.
+        if self._try_inline_wrapper_to_plain(old, new):
+            return True
+
+        # Special-case: visual-only wrapper added/removed around identical text,
+        # where the wrapper carries visual styling (style/class/id). In tables this
+        # happens a lot (<td>10.8</td> -> <td><strong style=...>10.8</strong></td>).
+        # Rendering this as del+ins duplicates the same value and looks terrible.
+        # Instead, render a single copy and mark the wrapper as "replaced".
+        if self._try_visual_wrapper_toggle_without_dup(old, new):
+            return True
+
+        # Fallback: If the new side collapses to a single TEXT node but the old side contains
+        # formatting tags, SequenceMatcher can emit ins->del ordering. Prefer a stable
+        # del->ins ordering and preserve old formatting in the deletion.
+        if len(new) == 1 and new[0][0] == TEXT and any(e[0] in (START, END) for e in old):
+            self.delete(old_start, old_end)
+            self.insert(new_start, new_end)
+            return True
+
+        # Special-case: unwrap/wrap inline wrapper (e.g. <b>/<strong>) with same text.
+        # Fixes Bold -> Normal and maintains consistent Delete -> Insert.
+        if self._can_unwrap_wrapper(old, new):
+            self.delete(old_start, old_end)
+            self.insert(new_start, new_end)
+            return True
+
+        # Special-case: visual-only changes (same text, different attrs/tag).
+        # Required to mark font-size/font-weight/class/style/id changes as diffs even
+        # when text is identical.
+        if self._can_visual_container_replace(old, new):
+            if getattr(self.config, 'visual_replace_inline', True):
+                # Render inline del->ins while keeping styles, so changes like
+                # font-size/font-weight don't turn into separate block lines.
+                self._render_visual_replace_inline(old, new)
+            else:
+                self.delete(old_start, old_end)
+                self.insert(new_start, new_end)
+            return True
+        
+        return False
+
+    def _handle_matching_event_types(self, old_event, new_event):
+        """Maneja eventos del mismo tipo."""
+        event_type = old_event[0]
+        if event_type == START:
+            old_, (old_tag, old_attrs), old_pos = old_event
+            _, (tag, attrs), pos = new_event
+            self.enter_mark_replaced(pos, tag, attrs, old_attrs)
+        elif event_type == END:
+            _, tag, pos = new_event
+            if not self.leave(pos, tag):
+                self.leave(pos, old_event[1])
+        elif event_type == TEXT:
+            _, new_text, pos = new_event
+            self.diff_text(pos, old_event[1], new_text)
+        else:
+            self.append(*new_event)
+
+    def _handle_mismatched_event_types(self, old_event, new_event, old_start, old_end, 
+                                       new_start, new_end, idx):
+        """Maneja eventos de tipos diferentes."""
+        # If the old event was text and the new one is the start or end of a tag
+        if old_event[0] == TEXT and new_event[0] in (START, END):
+            _, text, pos = old_event
+            self.mark_text(pos, text, 'del')
+            type, data, pos = new_event
+            if type == START:
+                self.enter(pos, *data)
+            else:
+                self.leave(pos, data)
+            return False
+
+        # Old stream opened or closed a tag that went away in the new one
+        if old_event[0] in (START, END) and new_event[0] == TEXT:
+            # Prefer a stable delete->insert representation that preserves
+            # the old formatting wrappers (e.g. <strong>...) instead of
+            # dropping them and emitting only an <ins>.
+            #
+            # This is especially important for changes like:
+            #   "Texto <strong>en negrita</strong>" -> "Texto normal"
+            # where the deleted content must remain bold (inside <del>).
+            self.delete(old_start + idx, old_end)
+            self.insert(new_start + idx, new_end)
+            return True  # Signal to break
+        
+        return False
+
+    def replace(self, old_start, old_end, new_start, new_end):
+        old = self._old_events[old_start:old_end]
+        new = self._new_events[new_start:new_end]
+
+        # Handle special cases first
+        if self._handle_replace_special_cases(old, new, old_start, old_end, new_start, new_end):
+            return
+
+        # Process events pairwise
+        for idx, (old_event, new_event) in enumerate(longzip(old, new)):
+            if old_event is None:
+                self.insert(new_start + idx, new_end + idx)
+                break
+            elif new_event is None:
+                self.delete(old_start + idx, old_end + idx)
+                break
+ 
+            # Handle matching event types
+            if old_event[0] == new_event[0]:
+                self._handle_matching_event_types(old_event, new_event)
+            else:
+                # Handle mismatched event types
+                if self._handle_mismatched_event_types(old_event, new_event, 
+                                                       old_start, old_end, 
+                                                       new_start, new_end, idx):
+                    break
+
+    def _try_visual_wrapper_toggle_without_dup(self, old_events, new_events):
+        """
+        If one side is plain text and the other wraps the *same* text in a single
+        inline wrapper with visual attrs (style/class/id), render only one copy
+        and mark it as tagdiff_replaced.
+
+        This reduces noisy table diffs where many cells get styled (highlighting),
+        and avoids duplicating values inside <td>/<th>.
+        """
+
+        def parse(events):
+            lws, core, tws = strip_edge_whitespace_events(events)
+            if len(core) == 1 and core[0][0] == TEXT:
+                return ('plain', lws, core[0], tws, None, None)
+            if len(core) >= 3 and core[0][0] == START and core[-1][0] == END:
+                tag, attrs = core[0][1]
+                lname = qname_localname(tag)
+                if lname in INLINE_FORMATTING_TAGS and qname_localname(core[-1][1]) == lname:
+                    inner = core[1:-1]
+                    if inner and all(t == TEXT for (t, _d, _p) in inner):
+                        return ('wrap', lws, inner, tws, (tag, attrs), lname)
+            return None
+
+        o = parse(old_events)
+        n = parse(new_events)
+        if not o or not n:
+            return False
+
+        # Addition: plain -> styled wrapper
+        if o[0] == 'plain' and n[0] == 'wrap':
+            _o_kind, _o_lws, o_text_ev, _o_tws, _o_tagattrs, _o_lname = o
+            _n_kind, n_lws, n_inner, n_tws, (n_tag, n_attrs), _n_lname = n
+            if not has_visual_attrs(n_attrs, self.config):
+                return False
+            if collapse_ws(o_text_ev[1]) != collapse_ws(extract_text_from_events(n_inner)):
+                return False
+            for ev in n_lws:
+                self.append(*ev)
+            # Genshi Attrs is list-like, not dict-like
+            attrs2 = Attrs(list(n_attrs))
+            attrs2 = self.inject_class(attrs2, 'tagdiff_replaced')
+            attrs2 |= [(QName('data-old-tag'), 'none')]
+            pos = (n_inner[0][2] if n_inner else (new_events[0][2] if new_events else old_events[0][2]))
+            self.append(START, (n_tag, attrs2), pos)
+            for ev in n_inner:
+                self.append(*ev)
+            self.append(END, n_tag, pos)
+            for ev in n_tws:
+                self.append(*ev)
+            return True
+
+        # Removal: styled wrapper -> plain
+        if o[0] == 'wrap' and n[0] == 'plain':
+            _o_kind, _o_lws, o_inner, _o_tws, (_o_tag, o_attrs), o_lname = o
+            _n_kind, n_lws, n_text_ev, n_tws, _n_tagattrs, _n_lname = n
+            if not has_visual_attrs(o_attrs, self.config):
+                return False
+            if collapse_ws(extract_text_from_events(o_inner)) != collapse_ws(n_text_ev[1]):
+                return False
+            for ev in n_lws:
+                self.append(*ev)
+            span_tag = QName('span')
+            span_attrs = Attrs()
+            span_attrs |= [(QName('data-old-tag'), o_lname)]
+            span_attrs = self.inject_refattr(span_attrs, o_attrs)
+            span_attrs = self.inject_class(span_attrs, 'tagdiff_replaced')
+            self.append(START, (span_tag, span_attrs), n_text_ev[2])
+            self.append(*n_text_ev)
+            self.append(END, span_tag, n_text_ev[2])
+            for ev in n_tws:
+                self.append(*ev)
+            return True
+
+        return False
+
+    def delete(self, start, end):
+        with self.context('del'):
+            self.block_process(self._old_events[start:end])
+
+    def insert(self, start, end):
+        with self.context('ins'):
+            self.block_process(self._new_events[start:end])
+
+    def unchanged(self, start, end):
+        with self.context(None):
+            self.block_process(self._old_events[start:end])
+
+    def enter(self, pos, tag, attrs):
+        self._stack.append(tag)
+        self.append(START, (tag, attrs), pos)
+
+    def enter_mark_replaced(self, pos, tag, attrs, old_attrs):
+        attrs = self.inject_class(attrs, 'tagdiff_replaced')
+        attrs = self.inject_refattr(attrs, old_attrs)
+        self._stack.append(tag)
+        self.append(START, (tag, attrs), pos)
+
+    def leave(self, pos, tag):
+        if not self._stack:
+            return False
+        if tag == self._stack[-1]:
+            self.append(END, tag, pos)
+            self._stack.pop()
+            return True
+        return False
+
+    def leave_all(self):
+        if self._stack:
+            last_pos = (self._new_events or self._old_events)[-1][2]
+            for tag in reversed(self._stack):
+                self.append(END, tag, last_pos)
+        del self._stack[:]
+
+    def _handle_start_event_in_block(self, tag, attrs, pos):
+        """Maneja eventos START dentro de block_process."""
+        lname = qname_localname(tag)
+        # Visualize <br> changes explicitly
+        if lname == 'br' and self._context in ('ins', 'del'):
+            marker = getattr(self.config, 'linebreak_marker', u'\u00b6')
+            if self._context == 'ins':
+                # <ins>¶</ins><br>
+                self.mark_text(pos, marker, 'ins')
+                self.enter(pos, tag, attrs)
+            else:
+                # <del>¶</del><br> (render a line break so double-<br> deletions
+                # show an empty line with a visible marker)
+                self.mark_text(pos, marker, 'del')
+                # Render a visual <br> even though it's deleted, so removed
+                # blank lines are visible (and consecutive <br><br> show a
+                # standalone ¶ line).
+                self.append(START, (tag, attrs), pos)
+                self.append(END, tag, pos)
+                self._skip_end_for.append(lname)
+            return True
+
+        # Wrap void/non-textual elements (e.g. <img>) with <ins>/<del> so the
+        # change is visible even though there is no TEXT to mark.
+        wrap_void = set(getattr(self.config, 'wrap_void_tag_changes_with_ins_del', ()))
+        if lname in wrap_void and self._context in ('ins', 'del'):
+            change_tag = QName(self._context)
+            self.append(START, (change_tag, Attrs()), pos)
+            self.enter(pos, tag, attrs)
+            self._wrap_change_end_for.append((lname, change_tag))
+            return True
+
+        self.enter(pos, tag, attrs)
+        return False
+
+    def _handle_end_event_in_block(self, data, pos):
+        """Maneja eventos END dentro de block_process."""
+        lname = qname_localname(data)
+        if self._skip_end_for and self._skip_end_for[-1] == lname:
+            self._skip_end_for.pop()
+            return True
+
+        # Close wrapper <ins>/<del> for wrapped void elements after their END.
+        if self._wrap_change_end_for and self._wrap_change_end_for[-1][0] == lname:
+            _lname, change_tag = self._wrap_change_end_for.pop()
+            self.leave(pos, data)
+            self.append(END, change_tag, pos)
+            return True
+
+        self.leave(pos, data)
+        return False
+
+    def _handle_text_event_in_block(self, data, pos):
+        """Maneja eventos TEXT dentro de block_process."""
+        if self._context is not None:
+            # Wrap visible text AND inline whitespace (e.g. the space between words)
+            # so inserts like "en negrita" highlight the whole phrase including space.
+            # Avoid wrapping newline indentation, which would create noisy diffs.
+            if data.strip() or ('\n' not in data and '\r' not in data):
+                self.mark_text(pos, data, self._context)
+                return
+        self.append(TEXT, data, pos)
+
+    def block_process(self, events):
+        for event in events:
+            event_type, data, pos = event
+            if event_type == START:
+                tag, attrs = data
+                if self._handle_start_event_in_block(tag, attrs, pos):
+                    continue
+            elif event_type == END:
+                if self._handle_end_event_in_block(data, pos):
+                    continue
+            elif event_type == TEXT:
+                self._handle_text_event_in_block(data, pos)
+            else:
+                self.append(event_type, data, pos)
+
+    def _process_replace_opcode(self, old_atoms_slice, new_atoms_slice):
+        """Procesa un opcode de tipo 'replace'."""
+        old_events = concat_events(old_atoms_slice)
+        new_events = concat_events(new_atoms_slice)
+        # Diff the expanded events with an inner EventDiffer (no atomization)
+        inner = _EventDiffer(old_events, new_events, self.config)
+        for ev in inner.get_diff_events():
+            self.append(*ev)
+
+    def _process_equal_opcode(self, old_atoms_slice, new_atoms_slice):
+        """Procesa un opcode de tipo 'equal' con manejo especial para tablas."""
+        # For table-related blocks, run an inner event diff even when the
+        # outer atom keys are equal. This catches visual-only formatting
+        # changes (e.g. <th> style, wrapping <strong style=...>) without
+        # breaking table structure.
+        for a_old, a_new in longzip(old_atoms_slice, new_atoms_slice):
+            if a_old is None:
+                with self.context(None):
+                    self.block_process(concat_events([a_new]))
+                continue
+            if a_new is None:
+                with self.context(None):
+                    self.block_process(concat_events([a_old]))
+                continue
+            if a_new.get('kind') == 'block' and a_new.get('tag') in ('tr', 'td', 'th'):
+                inner = _EventDiffer(a_old['events'], a_new['events'], self.config)
+                for ev in inner.get_diff_events():
+                    self.append(*ev)
+            else:
+                old_events = a_old.get('events') or []
+                new_events = a_new.get('events') or []
+
+                # If atoms compare equal by key but differ in event streams due to
+                # non-textual "void" elements (e.g. <img>), run an inner event diff
+                # so additions/removals become visible as <ins>/<del>.
+                force_tags = set(getattr(self.config, 'force_event_diff_on_equal_for_tags', ()))
+                if force_tags and old_events != new_events:
+                    def _has_force_tag(events):
+                        for et, d, _p in events:
+                            if et == START:
+                                t, _a = d
+                                if qname_localname(t) in force_tags:
+                                    return True
+                        return False
+
+                    if _has_force_tag(old_events) or _has_force_tag(new_events):
+                        # Prefer diffing only the *children* when both sides are a
+                        # simple container (START...END). This keeps unchanged prefix
+                        # text outside of <del>/<ins> when the only real change is a
+                        # void element like <img> being added/removed.
+                        if (
+                            old_events
+                            and new_events
+                            and old_events[0][0] == START and old_events[-1][0] == END
+                            and new_events[0][0] == START and new_events[-1][0] == END
+                            and old_events[0][1][0] == new_events[0][1][0]
+                            and old_events[-1][1] == new_events[-1][1]
+                        ):
+                            # Emit container start, diff children, then container end
+                            (cont_tag, cont_attrs) = new_events[0][1]
+                            cont_pos = new_events[0][2]
+                            self.enter(cont_pos, cont_tag, cont_attrs)
+
+                            old_children = old_events[1:-1]
+                            new_children = new_events[1:-1]
+
+                            def _visible_ws(s):
+                                if not s:
+                                    return s
+                                if not getattr(self.config, 'preserve_whitespace_in_diff', True):
+                                    return s
+                                # Keep newlines (indentation) as-is, but make inline
+                                # whitespace visible inside <ins>/<del>.
+                                return u''.join((u'\u00a0' if (ch.isspace() and ch not in u'\n\r') else ch) for ch in s)
+
+                            def _split_text_then_force_tail(children):
+                                # Keep leading/trailing whitespace-only TEXT as-is, but require
+                                # at most one TEXT with non-whitespace content.
+                                if children is None:
+                                    return None
+                                leading_ws = []
+                                i = 0
+                                while i < len(children) and children[i][0] == TEXT and (children[i][1] or u'').strip() == u'':
+                                    leading_ws.append(children[i])
+                                    i += 1
+                                if i >= len(children):
+                                    return leading_ws, None, []
+                                if children[i][0] != TEXT:
+                                    return None
+                                text_ev = children[i]
+                                tail = children[i + 1:]
+                                # Tail must be whitespace-only TEXT or START/END of force tags.
+                                for et, d, _p in tail:
+                                    if et == TEXT:
+                                        if (d or u'').strip() != u'':
+                                            return None
+                                    elif et in (START, END):
+                                        t = d[0] if et == START else d
+                                        if qname_localname(t) not in force_tags:
+                                            return None
+                                    else:
+                                        return None
+                                return leading_ws, text_ev, tail
+
+                            # Ultra-specific: keep common text unchanged and only mark the
+                            # trailing void tail (plus any trailing whitespace) as ins/del.
+                            parsed_old = _split_text_then_force_tail(old_children)
+                            parsed_new = _split_text_then_force_tail(new_children)
+                            if parsed_old and parsed_new and parsed_old[1] and parsed_new[1]:
+                                old_lead, old_text_ev, old_tail = parsed_old
+                                new_lead, new_text_ev, new_tail = parsed_new
+                                old_text = old_text_ev[1] or u''
+                                new_text = new_text_ev[1] or u''
+                                if collapse_ws(old_text) == collapse_ws(new_text):
+                                    pre_len = longest_common_prefix_len(old_text, new_text)
+                                    suf_len = longest_common_suffix_len(old_text, new_text, max_prefix=pre_len)
+                                    old_mid = old_text[pre_len:len(old_text) - suf_len if suf_len else len(old_text)]
+                                    new_mid = new_text[pre_len:len(new_text) - suf_len if suf_len else len(new_text)]
+                                    common_prefix = old_text[:pre_len]
+                                    common_suffix = old_text[len(old_text) - suf_len:] if suf_len else u''
+
+                                    # Emit leading whitespace from "new"
+                                    for ev in new_lead:
+                                        self.append(*ev)
+                                    # Emit common text unchanged (prefix + suffix)
+                                    self.append(TEXT, common_prefix + common_suffix, new_text_ev[2])
+
+                                    # Delete tail (mid + old_tail)
+                                    if (old_mid or old_tail) and not (new_mid or new_tail):
+                                        self.append(START, (QName('del'), Attrs()), old_text_ev[2])
+                                        if old_mid:
+                                            self.append(TEXT, _visible_ws(old_mid), old_text_ev[2])
+                                        for ev in old_tail:
+                                            self.append(*ev)
+                                        self.append(END, QName('del'), old_text_ev[2])
+                                    # Insert tail (mid + new_tail)
+                                    elif (new_mid or new_tail) and not (old_mid or old_tail):
+                                        self.append(START, (QName('ins'), Attrs()), new_text_ev[2])
+                                        if new_mid:
+                                            self.append(TEXT, _visible_ws(new_mid), new_text_ev[2])
+                                        for ev in new_tail:
+                                            self.append(*ev)
+                                        self.append(END, QName('ins'), new_text_ev[2])
+                                    else:
+                                        # Fallback to inner differ for anything more complex
+                                        inner = _EventDiffer(old_children, new_children, self.config)
+                                        for ev in inner.get_diff_events():
+                                            self.append(*ev)
+
+                                    # Emit trailing whitespace from "new" (events after tail are none by design)
+                                    self.leave(new_events[-1][2], new_events[-1][1])
+                                    continue
+
+                            inner = _EventDiffer(old_children, new_children, self.config)
+                            for ev in inner.get_diff_events():
+                                self.append(*ev)
+                            self.leave(new_events[-1][2], new_events[-1][1])
+                            continue
+
+                        inner = _EventDiffer(old_events, new_events, self.config)
+                        for ev in inner.get_diff_events():
+                            self.append(*ev)
+                        continue
+
+                with self.context(None):
+                    self.block_process(new_events)
+
+    def process(self):
+        self._result = []
+        # Run SequenceMatcher on atom keys (better alignment for lists/tables/text).
+        old_keys = [a['key'] for a in self._old_atoms]
+        new_keys = [a['key'] for a in self._new_atoms]
+        matcher = SequenceMatcher(None, old_keys, new_keys)
+        opcodes = matcher.get_opcodes()
+        if getattr(self.config, 'delete_first', True):
+            opcodes = normalize_opcodes_for_delete_first(opcodes)
+
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == 'replace':
+                self._process_replace_opcode(self._old_atoms[i1:i2], self._new_atoms[j1:j2])
+            elif tag == 'delete':
+                with self.context('del'):
+                    self.block_process(concat_events(self._old_atoms[i1:i2]))
+            elif tag == 'insert':
+                with self.context('ins'):
+                    self.block_process(concat_events(self._new_atoms[j1:j2]))
+            else:  # equal
+                self._process_equal_opcode(self._old_atoms[i1:i2], self._new_atoms[j1:j2])
+        self.leave_all()
+
+    def get_diff_stream(self):
+        if self._result is None:
+            self.process()
+        if getattr(self.config, 'merge_adjacent_change_tags', True):
+            self._result = merge_adjacent_change_tags(self._result)
+        return Stream(self._result)
+
+    def _can_unwrap_wrapper(self, old_events, new_events):
+        """
+        Detect cases like:
+          old: <strong>TEXT</strong>
+          new: TEXT
+        or the inverse. If so, we force a delete then insert at that range to
+        avoid inverted output and broken rendering in inline wrappers.
+        """
+        def is_inline_wrapper(tag):
+            return qname_localname(tag) in INLINE_FORMATTING_TAGS
+
+        def unwrap(events):
+            if len(events) >= 3 and events[0][0] == START and events[-1][0] == END:
+                tag0 = events[0][1][0]
+                tag1 = events[-1][1]
+                if tag0 == tag1 and is_inline_wrapper(tag0):
+                    inner = events[1:-1]
+                    txt = extract_text_from_events(inner)
+                    return qname_localname(tag0), txt
+            return None, None
+
+        old_tag, old_txt = unwrap(old_events)
+        new_tag, new_txt = unwrap(new_events)
+        old_plain = extract_text_from_events(old_events)
+        new_plain = extract_text_from_events(new_events)
+
+        # old wrapped -> new plain with same text
+        if old_tag and (not new_tag) and old_txt and old_txt == collapse_ws(new_plain):
+            return True
+        # old plain -> new wrapped with same text
+        if new_tag and (not old_tag) and new_txt and new_txt == collapse_ws(old_plain):
+            return True
+        return False
+
+    def _can_visual_container_replace(self, old_events, new_events):
+        """
+        Detect container/tag/attribute-only changes that should still produce a
+        visible diff:
+          <p style="...">Texto</p>  -> <p style="...">Texto</p>
+          <div id="a">X</div>       -> <div id="b">X</div>
+          <div>Texto</div>          -> <span>Texto</span>
+
+        We only apply this to a safe allowlist of tags to avoid blowing up
+        structural HTML (tables/lists).
+        """
+        if not old_events or not new_events:
+            return False
+        _lws, old_events, _tws = strip_edge_whitespace_events(old_events)
+        _lws2, new_events, _tws2 = strip_edge_whitespace_events(new_events)
+        if not old_events or not new_events:
+            return False
+        if old_events[0][0] != START or old_events[-1][0] != END:
+            return False
+        if new_events[0][0] != START or new_events[-1][0] != END:
+            return False
+
+        old_tag, old_attrs = old_events[0][1]
+        new_tag, new_attrs = new_events[0][1]
+        old_lname = qname_localname(old_tag)
+        new_lname = qname_localname(new_tag)
+
+        allowed = set(getattr(self.config, 'visual_container_tags', ()))
+        if old_lname not in allowed and new_lname not in allowed:
+            return False
+
+        old_txt = extract_text_from_events(old_events)
+        new_txt = extract_text_from_events(new_events)
+        if not old_txt or not new_txt:
+            return False
+        if collapse_ws(old_txt) != collapse_ws(new_txt):
+            return False
+
+        # Same visible text but different inline formatting structure (e.g. strong removed)
+        if structure_signature(old_events, self.config) != structure_signature(new_events, self.config):
+            return True
+
+        # If tag differs OR any tracked attribute differs, treat as visual change
+        if old_lname != new_lname:
+            return True
+        for attr in getattr(self.config, 'track_attrs', ('style', 'class', 'src', 'href')):
+            if old_attrs.get(attr) != new_attrs.get(attr):
+                return True
+        # Also consider id as a common visual/selection attribute in product HTML
+        if old_attrs.get('id') != new_attrs.get('id'):
+            return True
+
+        return False
+
+    def _wrap_inline_visual_replace(self, kind, wrapper_tag, attrs, inner_events, pos):
+        """Envuelve eventos internos en un wrapper inline para reemplazo visual."""
+        kind_tag = QName(kind)
+        wrapper_q = wrapper_tag
+        self.append(START, (kind_tag, Attrs()), pos)
+        self.append(START, (wrapper_q, attrs), pos)
+        # Render inner events verbatim (including <br>, <strong>, etc.)
+        with self.context(None):
+            self.block_process(inner_events)
+        self.append(END, wrapper_q, pos)
+        self.append(END, kind_tag, pos)
+
+    def _wrap_block_visual_replace(self, kind, wrapper_tag, attrs, inner_events, pos):
+        """
+        Keep HTML valid by not nesting block tags inside <ins>/<del>.
+        Instead:
+          <p style=old><del>TEXT</del></p>
+          <p style=new><ins>TEXT</ins></p>
+        """
+        kind_tag = QName(kind)
+        wrapper_q = wrapper_tag
+        self.append(START, (wrapper_q, attrs), pos)
+        self.append(START, (kind_tag, Attrs()), pos)
+        # Emit inner events without wrapping again (we are already inside <ins>/<del>),
+        # but convert <br> into a visible marker so double line breaks show an empty
+        # line with ¶ even when the change is "visual-only".
+        marker = getattr(self.config, 'linebreak_marker', u'\u00b6')
+        skip_br_end = 0
+        for et, d, p2 in inner_events:
+            if skip_br_end and et == END and qname_localname(d) == 'br':
+                skip_br_end -= 1
+                continue
+            if et == START:
+                ttag, tattrs = d
+                if qname_localname(ttag) == 'br':
+                    # inside <ins>/<del>, so plain TEXT marker is enough
+                    self.append(TEXT, marker, p2)
+                    self.append(START, (ttag, tattrs), p2)
+                    self.append(END, ttag, p2)
+                    skip_br_end += 1
+                    continue
+            self.append(et, d, p2)
+        self.append(END, kind_tag, pos)
+        self.append(END, wrapper_q, pos)
+
+    def _render_visual_replace_inline(self, old_events, new_events):
+        """
+        Inline visual replace:
+          <p style="old">TEXT</p> -> <p style="new">TEXT</p>
+        becomes:
+          <del><span style="old">TEXT</span></del><ins><span style="new">TEXT</span></ins>
+
+        This preserves reading order (del then ins) and keeps the diff inline.
+        """
+        lws_old, old_core, tws_old = strip_edge_whitespace_events(old_events)
+        lws_new, new_core, tws_new = strip_edge_whitespace_events(new_events)
+
+        # Preserve leading/trailing whitespace events (mostly new-side to keep DOM stable)
+        for ev in lws_new:
+            self.append(*ev)
+
+        old_events = old_core
+        new_events = new_core
+        if not old_events or not new_events:
+            # fallback
+            self.delete(0, 0)
+            return
+
+        # Pick a stable position for injected events
+        pos = (new_events or old_events)[0][2]
+
+        old_tag, old_attrs = old_events[0][1]
+        new_tag, new_attrs = new_events[0][1]
+
+        old_inner = old_events[1:-1]
+        new_inner = new_events[1:-1]
+
+        old_l = qname_localname(old_tag)
+        new_l = qname_localname(new_tag)
+        # Preserve actual wrapper tags when possible:
+        # - inline wrappers: span/strong/em...
+        # - block wrappers: p/h1..h6 (titles/paragraphs)
+        old_wrap = old_tag if (old_l in INLINE_FORMATTING_TAGS or old_l in BLOCK_WRAPPER_TAGS) else QName('span')
+        new_wrap = new_tag if (new_l in INLINE_FORMATTING_TAGS or new_l in BLOCK_WRAPPER_TAGS) else QName('span')
+
+        if old_l in BLOCK_WRAPPER_TAGS:
+            self._wrap_block_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
+        else:
+            self._wrap_inline_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
+
+        if new_l in BLOCK_WRAPPER_TAGS:
+            self._wrap_block_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
+        else:
+            self._wrap_inline_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
+
+        for ev in tws_new:
+            self.append(*ev)
+
+    def _find_inline_wrapper_bounds(self, events):
+        """Encuentra los límites de un wrapper inline único en los eventos."""
+        # Find first START of inline wrapper
+        start_idx = None
+        for i, (t, d, _p) in enumerate(events):
+            if t == START and qname_localname(d[0]) in INLINE_FORMATTING_TAGS:
+                start_idx = i
+                break
+        if start_idx is None:
+            return None, None
+
+        # Find matching END for that wrapper (non-nested heuristic)
+        wname = qname_localname(events[start_idx][1][0])
+        depth = 0
+        end_idx = None
+        for j in range(start_idx, len(events)):
+            t, d, _p = events[j]
+            if t == START and qname_localname(d[0]) == wname:
+                depth += 1
+            elif t == END and qname_localname(d) == wname:
+                depth -= 1
+                if depth == 0:
+                    end_idx = j
+                    break
+        if end_idx is None:
+            return None, None
+
+        # Ensure there are no other inline wrapper starts outside this subtree
+        for i, (t, d, _p) in enumerate(events):
+            if i < start_idx or i > end_idx:
+                if t == START and qname_localname(d[0]) in INLINE_FORMATTING_TAGS:
+                    return None, None
+
+        return start_idx, end_idx
+
+    def _validate_prefix_suffix_alignment(self, prefix_text, suffix_text, old_text, new_text):
+        """Valida que el prefijo y sufijo común estén alineados correctamente."""
+        pre_len = longest_common_prefix_len(old_text, new_text)
+        suf_len = longest_common_suffix_len(old_text, new_text, max_prefix=pre_len)
+        return pre_len == len(prefix_text) and suf_len == len(suffix_text)
+
+    def _try_inline_wrapper_to_plain(self, old_events, new_events):
+        """
+        Handle patterns like:
+          <p>Texto <u>subrayado</u></p> -> <p>Texto normal</p>
+        without marking the unchanged prefix ("Texto ") as del/ins.
+
+        This only triggers when:
+        - new is a single TEXT event (within the compared range)
+        - old has exactly one inline wrapper segment (span/strong/b/em/i/u)
+        - common prefix/suffix align cleanly with old's leading/trailing TEXT events
+        """
+        if len(new_events) != 1 or new_events[0][0] != TEXT:
+            return False
+        if not old_events:
+            return False
+
+        # Identify a single inline wrapper subtree inside old_events
+        start_idx, end_idx = self._find_inline_wrapper_bounds(old_events)
+        if start_idx is None or end_idx is None:
+            return False
+
+        # Split old events into prefix TEXT (before wrapper), wrapper subtree, suffix TEXT (after wrapper)
+        prefix_events = old_events[:start_idx]
+        wrapper_events = old_events[start_idx:end_idx + 1]
+        suffix_events = old_events[end_idx + 1:]
+
+        old_text = raw_text_from_events(old_events)
+        new_text = new_events[0][1] or u''
+        prefix_text = raw_text_from_events(prefix_events)
+        suffix_text = raw_text_from_events(suffix_events)
+
+        # Validate prefix/suffix alignment
+        if not self._validate_prefix_suffix_alignment(prefix_text, suffix_text, old_text, new_text):
+            return False
+
+        # Compute common prefix/suffix on raw strings
+        pre_len = longest_common_prefix_len(old_text, new_text)
+        suf_len = longest_common_suffix_len(old_text, new_text, max_prefix=pre_len)
+
+        # Remaining new text that replaces the wrapper subtree
+        mid_new = new_text[pre_len:len(new_text) - suf_len if suf_len else len(new_text)]
+
+        # Emit prefix unchanged
+        if prefix_text:
+            pos = (prefix_events[-1][2] if prefix_events else new_events[0][2])
+            self.append(TEXT, prefix_text, pos)
+
+        # Emit deletion preserving wrapper formatting, then insertion of the replacement text
+        with self.context('del'):
+            self.block_process(wrapper_events)
+        if mid_new:
+            self.mark_text(new_events[0][2], mid_new, 'ins')
+
+        # Emit suffix unchanged
+        if suffix_text:
+            self.append(TEXT, suffix_text, new_events[0][2])
+
+        return True
+
+
+class _EventDiffer(StreamDiffer):
+    """
+    Internal differ used for replace blocks, operating directly on event lists.
+    It bypasses atomization to avoid recursive re-grouping side-effects.
+    """
+
+    def __init__(self, old_events, new_events, config):
+        self.config = config or DiffConfig()
+        # IMPORTANT: Keep original TEXT events intact and let diff_text() handle
+        # word-level granularity. Splitting TEXT here can cause insertions to
+        # appear "inside" deletions for phrase replacements.
+        self._old_events = list(old_events)
+        self._new_events = list(new_events)
+        self._old_atoms = None
+        self._new_atoms = None
+        self._result = []
+        self._stack = []
+        self._context = None
+        self._skip_end_for = []
+        self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
+
+    def get_diff_events(self):
+        self.process_events()
+        return self._result
+
+    def _handle_table_cell_wrapper_pattern(self, opcodes, k):
+        """
+        Maneja el patrón especial de tabla donde se agrega un wrapper inline estilizado
+        alrededor del texto existente de una celda/encabezado.
+        """
+        if k + 2 >= len(opcodes):
+            return False
+        
+        t1, a1, a2, b1, b2 = opcodes[k]
+        t2, c1, c2, d1, d2 = opcodes[k + 1]
+        t3, _e1, _e2, f1, f2 = opcodes[k + 2]
+        
+        # Pattern: replace(START) + equal(TEXT) + insert(wrapper END)
+        if not (t1 == 'replace' and t2 == 'equal' and t3 == 'insert' and 
+                (a2 - a1) == 1 and (c2 - c1) == 1 and (d2 - d1) == 1 and (b2 - b1) >= 2):
+            return False
+        
+        old_start_ev = self._old_events[a1]
+        old_text_ev = self._old_events[c1]
+        new_text_ev = self._new_events[d1]
+        
+        if not (old_start_ev[0] == START and old_text_ev[0] == TEXT and new_text_ev[0] == TEXT):
+            return False
+        
+        new_start_ev = self._new_events[b1]
+        if new_start_ev[0] != START:
+            return False
+        
+        cont_tag, cont_attrs_new = new_start_ev[1]
+        cont_l = qname_localname(cont_tag)
+        if cont_l not in ('th', 'td'):
+            return False
+        
+        # Find wrapper with visual attrs
+        wrapper_idx = None
+        wrapper_tag = None
+        wrapper_attrs = None
+        for j in range(b1 + 1, b2):
+            ev = self._new_events[j]
+            if ev[0] == START:
+                w_tag, w_attrs = ev[1]
+                w_l = qname_localname(w_tag)
+                if w_l in INLINE_FORMATTING_TAGS and has_visual_attrs(w_attrs, self.config):
+                    wrapper_idx = j
+                    wrapper_tag, wrapper_attrs = w_tag, w_attrs
+        
+        if wrapper_idx is None or (f2 - f1) < 1:
+            return False
+        
+        end_ev = self._new_events[f1]
+        if not (end_ev[0] == END and qname_localname(end_ev[1]) == qname_localname(wrapper_tag)):
+            return False
+        
+        if collapse_ws(old_text_ev[1]) != collapse_ws(new_text_ev[1]):
+            return False
+        
+        # Render the pattern
+        old_cont_attrs = old_start_ev[1][1]
+        self.enter_mark_replaced(new_start_ev[2], cont_tag, cont_attrs_new, old_cont_attrs)
+        # whitespace between container and wrapper
+        for j in range(b1 + 1, wrapper_idx):
+            self.append(*self._new_events[j])
+        # wrapper START marked replaced
+        w_attrs2 = Attrs(list(wrapper_attrs))
+        w_attrs2 = self.inject_class(w_attrs2, 'tagdiff_replaced')
+        w_attrs2 |= [(QName('data-old-tag'), 'none')]
+        self.enter(self._new_events[wrapper_idx][2], wrapper_tag, w_attrs2)
+        # shared TEXT once
+        self.append(TEXT, old_text_ev[1], new_text_ev[2])
+        # close wrapper and emit remaining insert tail (indentation)
+        self.leave(end_ev[2], end_ev[1])
+        for j in range(f1 + 1, f2):
+            self.append(*self._new_events[j])
+        
+        return True
+
+    def process_events(self):
+        # Fast path: treat visual-only container changes as a single replace so we can
+        # render del->ins even when SequenceMatcher only flags the START tag.
+        if should_force_visual_replace(self._old_events, self._new_events, self.config):
+            self.replace(0, len(self._old_events), 0, len(self._new_events))
+            self.leave_all()
+            return
+
+        matcher = SequenceMatcher(None, self._old_events, self._new_events)
+        opcodes = matcher.get_opcodes()
+        if getattr(self.config, 'delete_first', True):
+            opcodes = normalize_opcodes_for_delete_first(opcodes)
+        opcodes = normalize_inline_wrapper_opcodes(opcodes, self._old_events, self._new_events)
+        opcodes = normalize_inline_wrapper_tag_change_opcodes(opcodes, self._old_events, self._new_events, self.config)
+
+        # Table-aware special-case: styled inline wrapper added around an existing
+        # cell/header text should be marked as tagdiff_replaced without duplicating
+        # the text (no del+ins copy).
+
+        k = 0
+        while k < len(opcodes):
+            # Try to handle table cell wrapper pattern
+            if self._handle_table_cell_wrapper_pattern(opcodes, k):
+                k += 3
+                continue
+
+            tag, i1, i2, j1, j2 = opcodes[k]
+            if tag == 'replace':
+                self.replace(i1, i2, j1, j2)
+            elif tag == 'delete':
+                self.delete(i1, i2)
+            elif tag == 'insert':
+                self.insert(j1, j2)
+            else:
+                self.unchanged(i1, i2)
+            k += 1
+        self.leave_all()
+
+

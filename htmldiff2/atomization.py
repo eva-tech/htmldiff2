@@ -1,0 +1,148 @@
+# -*- coding: utf-8 -*-
+"""
+Funciones de atomización de eventos para mejor alineación en diffs.
+"""
+from genshi.core import START, END, TEXT
+from .config import STRUCTURAL_TAGS
+from .utils import (
+    qname_localname, extract_text_from_events, collapse_ws,
+    attrs_signature, structure_signature, is_diff_wrapper
+)
+
+
+def build_block_tags_set(config):
+    """Construye el conjunto de tags que deben ser atomizados como bloques."""
+    block_tags = set()
+    if getattr(config, 'enable_list_atomization', True):
+        block_tags |= set(['li'])
+    if getattr(config, 'enable_table_atomization', True):
+        block_tags |= set(['td', 'th', 'tr'])
+    if getattr(config, 'enable_inline_wrapper_atomization', True):
+        # Helps treat formatting wrapper removal/addition as a cohesive unit.
+        block_tags |= set(['b', 'strong', 'i', 'em'])
+    # Visual tags to atomize for alignment (avoid large container divs).
+    visual_tags = set(getattr(config, 'visual_atomize_tags', ()))
+    block_tags |= visual_tags
+    return block_tags, visual_tags
+
+
+def find_block_end(events, start_idx, tag_name):
+    """Encuentra el índice del evento END que cierra el bloque que comienza en start_idx."""
+    depth = 1
+    n = len(events)
+    j = start_idx + 1
+    while j < n and depth:
+        t2, d2, _p2 = events[j]
+        if t2 == START and qname_localname(d2[0]) == tag_name:
+            depth += 1
+        elif t2 == END and qname_localname(d2) == tag_name:
+            depth -= 1
+        j += 1
+    return j
+
+
+def has_structural_children(block_events):
+    """Verifica si un bloque div contiene hijos estructurales."""
+    for t2, d2, _p2 in block_events[1:-1]:
+        if t2 == START and qname_localname(d2[0]) in STRUCTURAL_TAGS:
+            return True
+    return False
+
+
+def create_block_atom_key(lname, block_events, attrs, config, visual_tags):
+    """Crea la clave de atomización para un bloque según su tipo."""
+    block_text = collapse_ws(extract_text_from_events(block_events))
+    if lname in ('td', 'th'):
+        # Cells: include attrs + formatting structure so visual-only changes
+        # (e.g. strong style) are detected, but ignore indentation whitespace.
+        return (lname, block_text, attrs_signature(attrs, config), 
+                structure_signature(block_events, config))
+    elif lname == 'tr':
+        # Rows: key only by visible text so style changes inside cells don't
+        # force a whole-row replace; inner diff will mark changes.
+        return (lname, block_text)
+    elif lname in visual_tags:
+        return (lname, block_text, attrs_signature(attrs, config), 
+                structure_signature(block_events, config))
+    else:
+        return (lname, block_text)
+
+
+def atomize_events(events, config):
+    """
+    Convert a flat list of Genshi events to 'atoms' that SequenceMatcher can
+    align better (esp. <li> and table cells), while preserving original events
+    for rendering.
+    """
+    from .config import _token_split_re
+    
+    atoms = []
+    i = 0
+    n = len(events)
+    block_tags, visual_tags = build_block_tags_set(config)
+
+    while i < n:
+        etype, data, pos = events[i]
+
+        # Treat <br> as a single atomic unit (START+END) so moving breaks doesn't
+        # disturb alignment of neighboring blocks and doesn't cause giant replaces.
+        if etype == START:
+            tag, attrs = data
+            lname0 = qname_localname(tag)
+            if lname0 == 'br' and i + 1 < n and events[i + 1][0] == END and qname_localname(events[i + 1][1]) == 'br':
+                atoms.append({'kind': 'br', 'key': ('br',), 'events': [events[i], events[i + 1]], 'pos': pos})
+                i += 2
+                continue
+
+        # Group structural blocks (<li>, <tr>, <td>/<th>) as atomic units
+        if etype == START:
+            tag, attrs = data
+            lname = qname_localname(tag)
+            # Don't treat the artificial wrapper (<div class="diff">) as a block atom,
+            # otherwise attribute-only changes inside can be swallowed as "equal".
+            wrapper = is_diff_wrapper(tag, attrs)
+
+            if lname in block_tags and not wrapper:
+                j = find_block_end(events, i, lname)
+                block_events = events[i:j]
+
+                # Heuristic: don't atomize large container divs that contain structural blocks
+                # (prevents swallowing report-content-like containers).
+                has_structural_child = False
+                if lname == 'div':
+                    has_structural_child = has_structural_children(block_events)
+                    if not has_structural_child:
+                        # Atomize this div as a visual block
+                        key = (lname, extract_text_from_events(block_events), 
+                               attrs_signature(attrs, config), 
+                               structure_signature(block_events, config)) if lname in visual_tags else \
+                              (lname, extract_text_from_events(block_events))
+                        atoms.append({'kind': 'block', 'tag': lname, 'key': key, 
+                                    'events': block_events, 'pos': pos})
+                        i = j
+                        continue
+
+                # For visual containers, include attribute signature so style/class/id
+                # changes produce a 'replace' opcode even if text stays the same.
+                if not (lname == 'div' and has_structural_child):
+                    key = create_block_atom_key(lname, block_events, attrs, config, visual_tags)
+                    atoms.append({'kind': 'block', 'tag': lname, 'key': key, 
+                                'events': block_events, 'pos': pos})
+                    i = j
+                    continue
+
+        # Tokenize text events for better alignment granularity
+        if etype == TEXT and getattr(config, 'tokenize_text', True) and data:
+            parts = [p for p in getattr(config, 'tokenize_regex', _token_split_re).split(data) if p != u'']
+            for p in parts:
+                atoms.append({'kind': 'text', 'key': ('t', p), 'events': [(TEXT, p, pos)], 'pos': pos})
+            i += 1
+            continue
+
+        # Default: single-event atom
+        atoms.append({'kind': 'event', 'key': ('e', etype, data), 'events': [events[i]], 'pos': pos})
+        i += 1
+
+    return atoms
+
+
