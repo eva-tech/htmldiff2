@@ -79,6 +79,12 @@ def run_regressions():
     _assert_contains(out, '<ins>C</ins>')
     assert '<del>A</del>' not in out
 
+    # Whitespace-only change inside a single TEXT node should be visible
+    out = htmldiff2.render_html_diff("<p>Texto con   espacios</p>", "<p>Texto con espacios</p>")
+    _assert_contains(out, "<del>")
+    # Only 2 spaces were removed (3 -> 1), so this should NOT create an insertion.
+    assert "<ins>" not in out
+
     # Void elements: adding/removing <img> should be visible as <ins>/<del>
     out = htmldiff2.render_html_diff("<p>Hola</p>", "<p>Hola <img src='a.jpg'/></p>")
     _assert_contains(out, '<ins>')

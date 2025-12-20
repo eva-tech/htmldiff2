@@ -173,6 +173,35 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 self.append(TEXT, u''.join(old[i1:i2]), pos)
                 continue
             if tag == 'replace':
+                # Special-case: whitespace-only "replace" where the only change is the
+                # multiplicity of spaces (e.g. "   " -> " "). SequenceMatcher tends
+                # to emit this as replace, which renders as del+ins. For EdenAI we
+                # prefer a minimal representation: keep the common whitespace
+                # unchanged, and only mark the extra spaces as deleted/inserted.
+                old_part = u''.join(old[i1:i2])
+                new_part = u''.join(new[j1:j2])
+                if (
+                    old_part
+                    and new_part
+                    and old_part.strip() == u''
+                    and new_part.strip() == u''
+                    and ('\n' not in old_part and '\r' not in old_part)
+                    and ('\n' not in new_part and '\r' not in new_part)
+                ):
+                    flush_pending()
+                    common_len = 0
+                    max_common = min(len(old_part), len(new_part))
+                    while common_len < max_common and old_part[common_len] == new_part[common_len]:
+                        common_len += 1
+                    if common_len:
+                        self.append(TEXT, new_part[:common_len], pos)
+                    old_rem = old_part[common_len:]
+                    new_rem = new_part[common_len:]
+                    if old_rem:
+                        pending_del.append(old_rem)
+                    if new_rem:
+                        pending_ins.append(new_rem)
+                    continue
                 pending_del.extend(old[i1:i2])
                 pending_ins.extend(new[j1:j2])
             elif tag == 'delete':
@@ -524,6 +553,33 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             else:
                 old_events = a_old.get('events') or []
                 new_events = a_new.get('events') or []
+
+                # Whitespace-only text changes can be hidden by atomization keys
+                # (we intentionally collapse whitespace for alignment). If this atom
+                # is a simple container with a single TEXT child, and the only
+                # difference is whitespace multiplicity, run an inner event diff so
+                # deleted/inserted spaces become visible.
+                if old_events != new_events:
+                    try:
+                        if (
+                            len(old_events) == 3
+                            and len(new_events) == 3
+                            and old_events[0][0] == START and new_events[0][0] == START
+                            and old_events[1][0] == TEXT and new_events[1][0] == TEXT
+                            and old_events[2][0] == END and new_events[2][0] == END
+                            and old_events[0][1][0] == new_events[0][1][0]
+                            and old_events[2][1] == new_events[2][1]
+                        ):
+                            old_txt = old_events[1][1] or u''
+                            new_txt = new_events[1][1] or u''
+                            if old_txt != new_txt and collapse_ws(old_txt) == collapse_ws(new_txt):
+                                inner = _EventDiffer(old_events, new_events, self.config)
+                                for ev in inner.get_diff_events():
+                                    self.append(*ev)
+                                continue
+                    except Exception:
+                        # If anything goes wrong, fall back to unchanged rendering.
+                        pass
 
                 # If atoms compare equal by key but differ in event streams due to
                 # non-textual "void" elements (e.g. <img>), run an inner event diff
