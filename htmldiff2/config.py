@@ -70,5 +70,13 @@ class DiffConfig(object):
     force_event_diff_on_equal_for_tags = ('img',)
     wrap_void_tag_changes_with_ins_del = ('img',)
 
+    # --- Optional: Add stable IDs to diff markers for per-change Apply/Reject in the frontend ---
+    #
+    # IMPORTANT: we intentionally use a data-* attribute by default because HTML `id`
+    # MUST be unique in the document, and a "paired" ins/del would otherwise create
+    # invalid HTML if both share the same `id`.
+    add_diff_ids = True
+    diff_id_attr = 'data-diff-id'
+
 
 

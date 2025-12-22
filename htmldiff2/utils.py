@@ -153,7 +153,7 @@ def structure_signature(events, config):
     return tuple(sig)
 
 
-def merge_adjacent_change_tags(events, merge_tags=('ins', 'del')):
+def merge_adjacent_change_tags(events, merge_tags=('ins', 'del'), config=None):
     """
     Merge adjacent change tags in a flat Genshi event stream:
       ... END ins, START ins ...  -> ... (merge into one ins) ...
@@ -163,21 +163,69 @@ def merge_adjacent_change_tags(events, merge_tags=('ins', 'del')):
     into:
       <ins>en negrita</ins>
 
-    Only merges when the <ins>/<del> tags have no attributes (pre-ID stage),
-    to avoid losing metadata.
+    Merges when:
+    - both tags have no attributes (legacy behavior), OR
+    - both tags have the same diff-id attribute (data-diff-id by default).
+
+    This keeps output compact even when add_diff_ids=True.
     """
     from genshi.core import START, END
+
+    def _attrs_to_dict(attrs):
+        try:
+            items = list(attrs) if attrs is not None else []
+        except Exception:
+            items = []
+        d = {}
+        for k, v in items:
+            d[text_type(k)] = text_type(v)
+        return d
+
+    def _find_matching_start_index(out_events, lname):
+        # Find the START that matches the last END for this lname in out_events.
+        depth = 0
+        for idx in range(len(out_events) - 1, -1, -1):
+            et, d, _p = out_events[idx]
+            if et == END and qname_localname(d) == lname:
+                depth += 1
+            elif et == START:
+                t, _a = d
+                if qname_localname(t) == lname:
+                    depth -= 1
+                    if depth == 0:
+                        return idx
+        return None
+
+    diff_id_attr = getattr(config, 'diff_id_attr', 'data-diff-id') if config is not None else 'data-diff-id'
     out = []
     for etype, data, pos in events:
         if etype == START:
             tag, attrs = data
             lname = qname_localname(tag)
-            if lname in merge_tags and attrs_is_empty(attrs):
-                if out and out[-1][0] == END and qname_localname(out[-1][1]) == lname:
+            if lname in merge_tags and out and out[-1][0] == END and qname_localname(out[-1][1]) == lname:
+                # Legacy merge: no-attrs
+                if attrs_is_empty(attrs):
                     # Remove previous END and skip this START, keeping one continuous tag.
                     out.pop()
                     continue
+
+                # ID-aware merge: merge if the adjacent ins/del share the same diff-id
+                this_attrs = _attrs_to_dict(attrs)
+                this_diff_id = this_attrs.get(diff_id_attr)
+                if this_diff_id:
+                    start_idx = _find_matching_start_index(out, lname)
+                    if start_idx is not None:
+                        prev_tag, prev_attrs = out[start_idx][1]
+                        prev_attrs_d = _attrs_to_dict(prev_attrs)
+                        prev_diff_id = prev_attrs_d.get(diff_id_attr)
+                        if prev_diff_id == this_diff_id:
+                            # Preserve the first START (and its metadata); just remove END + skip START.
+                            out.pop()
+                            continue
         out.append((etype, data, pos))
     return out
+
+
+
 
 

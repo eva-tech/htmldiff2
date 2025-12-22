@@ -16,4 +16,5 @@ Pipfile*
 # Ignore everything under these folders (including subfolders/files)
 libdiff/
 demo_viewer/
+eden_ws_tester/
 

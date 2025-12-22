@@ -1,5 +1,7 @@
 import doctest
 import htmldiff2
+from htmldiff2 import DiffConfig
+import re
 
 doctest.testmod(htmldiff2, verbose=True)
 
@@ -11,20 +13,20 @@ def _assert_contains(haystack, needle):
 def run_regressions():
     # Delete before insert ordering
     out = htmldiff2.render_html_diff('Foo baz', 'Foo blah baz')
-    _assert_contains(out, '<ins>')
+    _assert_contains(out, '<ins')
 
     # Bold -> normal should not invert order; should show a deletion (old formatting) before insertion.
     out = htmldiff2.render_html_diff('Foo <strong>bar</strong> baz', 'Foo bar baz')
-    _assert_contains(out, '<del>')
-    _assert_contains(out, '<ins>')
+    _assert_contains(out, '<del')
+    _assert_contains(out, '<ins')
 
     # Style-only change should be marked as a diff even if text is identical
     out = htmldiff2.render_html_diff(
         'Foo <span style="font-size:14px">bar</span>',
         'Foo <span style="font-size:20px">bar</span>',
     )
-    _assert_contains(out, '<del>')
-    _assert_contains(out, '<ins>')
+    _assert_contains(out, '<del')
+    _assert_contains(out, '<ins')
     _assert_contains(out, 'font-size:14px')
     _assert_contains(out, 'font-size:20px')
 
@@ -67,30 +69,30 @@ def run_regressions():
     out = htmldiff2.render_html_diff(old, new)
     # Either full replace (del+ins) or a minimal insert inside the li is acceptable,
     # but it must be localized to the modified item (don't nuke untouched items).
-    assert '<ins>' in out and 'cambiado' in out
-    assert '<del>Uno</del>' not in out
-    assert '<del>Tres</del>' not in out
+    assert '<ins' in out and 'cambiado' in out
+    assert not re.search(r"<del[^>]*>Uno</del>", out), out
+    assert not re.search(r"<del[^>]*>Tres</del>", out), out
 
     # Tables: change inside one <td> should be localized
     old = '<table><tr><td>A</td><td>B</td></tr></table>'
     new = '<table><tr><td>A</td><td>C</td></tr></table>'
     out = htmldiff2.render_html_diff(old, new)
-    _assert_contains(out, '<del>B</del>')
-    _assert_contains(out, '<ins>C</ins>')
-    assert '<del>A</del>' not in out
+    assert re.search(r"<del[^>]*>B</del>", out), out
+    assert re.search(r"<ins[^>]*>C</ins>", out), out
+    assert not re.search(r"<del[^>]*>A</del>", out), out
 
     # Whitespace-only change inside a single TEXT node should be visible
     out = htmldiff2.render_html_diff("<p>Texto con   espacios</p>", "<p>Texto con espacios</p>")
-    _assert_contains(out, "<del>")
+    _assert_contains(out, "<del")
     # Only 2 spaces were removed (3 -> 1), so this should NOT create an insertion.
-    assert "<ins>" not in out
+    assert "<ins" not in out
 
     # Void elements: adding/removing <img> should be visible as <ins>/<del>
     out = htmldiff2.render_html_diff("<p>Hola</p>", "<p>Hola <img src='a.jpg'/></p>")
-    _assert_contains(out, '<ins>')
+    _assert_contains(out, '<ins')
     _assert_contains(out, '<img')
     out = htmldiff2.render_html_diff("<p>Hola <img src='a.jpg'/></p>", "<p>Hola</p>")
-    _assert_contains(out, '<del>')
+    _assert_contains(out, '<del')
     _assert_contains(out, '<img')
 
     # EdenAI: inline wrapper tag change inside a paragraph should NOT mark the
@@ -109,6 +111,24 @@ def run_regressions():
     assert "The patient reports chest pain and fatigue." in out
     assert "<del>The patient reports chest pain and fatigue." not in out
     assert "<ins>The patient reports chest pain and fatigue." not in out
+
+    # Diff IDs (opt-in): paired del/ins must share the same group id.
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    cfg.diff_id_attr = "data-diff-id"
+    out = htmldiff2.render_html_diff('Foo <b>bar</b> baz', 'Foo <i>bar</i> baz', config=cfg)
+    m_del = re.search(r'<del[^>]*\bdata-diff-id="([^"]+)"', out)
+    m_ins = re.search(r'<ins[^>]*\bdata-diff-id="([^"]+)"', out)
+    assert m_del and m_ins, out
+    assert m_del.group(1) == m_ins.group(1), out
+
+    # Insert-only should still have a diff id
+    out = htmldiff2.render_html_diff('Foo', 'Foo bar', config=cfg)
+    assert re.search(r'<ins[^>]*\bdata-diff-id="[^"]+"', out), out
+
+    # Delete-only should still have a diff id
+    out = htmldiff2.render_html_diff('Foo bar', 'Foo', config=cfg)
+    assert re.search(r'<del[^>]*\bdata-diff-id="[^"]+"', out), out
 
 
 if __name__ == '__main__':

@@ -10,7 +10,7 @@ from itertools import chain
 from contextlib import contextmanager
 from genshi.core import Stream, QName, Attrs, START, END, TEXT
 
-from .config import DiffConfig, _leading_space_re, _diff_split_re, _token_split_re, INLINE_FORMATTING_TAGS, BLOCK_WRAPPER_TAGS
+from .config import DiffConfig, text_type, _leading_space_re, _diff_split_re, _token_split_re, INLINE_FORMATTING_TAGS, BLOCK_WRAPPER_TAGS
 from .utils import (
     qname_localname, collapse_ws, strip_edge_whitespace_events,
     extract_text_from_events, raw_text_from_events, concat_events,
@@ -34,12 +34,13 @@ def diff_genshi_stream(old_stream, new_stream):
     return differ.get_diff_stream()
 
 
-def render_html_diff(old, new, wrapper_element='div', wrapper_class='diff'):
+def render_html_diff(old, new, wrapper_element='div', wrapper_class='diff', config=None):
     """Renders the diff between two HTML fragments."""
     from .parser import parse_html
     old_stream = parse_html(old, wrapper_element, wrapper_class)
     new_stream = parse_html(new, wrapper_element, wrapper_class)
-    rv = diff_genshi_stream(old_stream, new_stream)
+    differ = StreamDiffer(old_stream, new_stream, config=config)
+    rv = differ.get_diff_stream()
     return rv.render('html', encoding=None)
 
 
@@ -64,6 +65,57 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         self._context = None
         self._skip_end_for = []  # used for suppressing void tags on delete (e.g. <br>)
         self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
+        self._diff_id_counter = 0
+        self._diff_id_stack = []
+
+    @contextmanager
+    def diff_group(self, diff_id=None):
+        """
+        Group multiple emitted diff markers under the same diff id.
+
+        When config.add_diff_ids is False, this is a no-op.
+        """
+        if not getattr(self.config, 'add_diff_ids', False):
+            yield None
+            return
+        if diff_id is None:
+            diff_id = self._new_diff_id()
+        self._diff_id_stack.append(text_type(diff_id))
+        try:
+            yield text_type(diff_id)
+        finally:
+            self._diff_id_stack.pop()
+
+    def _new_diff_id(self):
+        self._diff_id_counter += 1
+        return text_type(self._diff_id_counter)
+
+    def _active_diff_id(self):
+        if self._diff_id_stack:
+            return self._diff_id_stack[-1]
+        return None
+
+    def _set_attr(self, attrs, name, value):
+        q = QName(name)
+        try:
+            items = list(attrs) if attrs is not None else []
+        except Exception:
+            items = []
+        items = [(k, v) for (k, v) in items if k != q]
+        items.append((q, text_type(value)))
+        return Attrs(items)
+
+    def _change_attrs(self, base_attrs=None, diff_id=None):
+        """
+        Build Attrs for an <ins>/<del> wrapper, injecting diff id if enabled.
+        """
+        attrs = Attrs(list(base_attrs)) if base_attrs is not None else Attrs()
+        if getattr(self.config, 'add_diff_ids', False):
+            if diff_id is None:
+                diff_id = self._active_diff_id() or self._new_diff_id()
+            attr_name = getattr(self.config, 'diff_id_attr', 'data-diff-id')
+            attrs = self._set_attr(attrs, attr_name, diff_id)
+        return attrs
 
     @contextmanager
     def context(self, kind):
@@ -116,7 +168,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             return u'', s
         return match.group(), s[match.end():]
 
-    def mark_text(self, pos, text, tag):
+    def mark_text(self, pos, text, tag, diff_id=None):
         def _make_ws_visible(s):
             # Convert whitespace that would otherwise be collapsed by HTML into NBSPs,
             # but keep single mid-string spaces intact for readability.
@@ -133,7 +185,8 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         preserve_ws = getattr(self.config, 'preserve_whitespace_in_diff', True) and qname_localname(tag) in ('del', 'ins')
         if preserve_ws:
             text = _make_ws_visible(text)
-            self.append(START, (tag, Attrs()), pos)
+            attrs = self._change_attrs(diff_id=diff_id)
+            self.append(START, (tag, attrs), pos)
             self.append(TEXT, text, pos)
             self.append(END, tag, pos)
             return
@@ -141,7 +194,8 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         ws, text = self.cut_leading_space(text)
         if ws:
             self.append(TEXT, ws, pos)
-        self.append(START, (tag, Attrs()), pos)
+        attrs = self._change_attrs(diff_id=diff_id)
+        self.append(START, (tag, attrs), pos)
         self.append(TEXT, text, pos)
         self.append(END, tag, pos)
 
@@ -150,8 +204,8 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         new = self.text_split(new_text)
         matcher = SequenceMatcher(None, old, new)
 
-        def wrap(tag, words):
-            return self.mark_text(pos, u''.join(words), tag)
+        def wrap(tag, words, diff_id=None):
+            return self.mark_text(pos, u''.join(words), tag, diff_id=diff_id)
 
         # Enforce deterministic delete->insert ordering within each changed region.
         # SequenceMatcher can produce patterns like delete/insert/delete (e.g. when
@@ -160,11 +214,19 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         pending_ins = []
 
         def flush_pending():
+            if pending_del and pending_ins:
+                # Pair del+ins under the same diff-id for per-change frontend actions.
+                diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
+                wrap('del', pending_del, diff_id=diff_id)
+                del pending_del[:]
+                wrap('ins', pending_ins, diff_id=diff_id)
+                del pending_ins[:]
+                return
             if pending_del:
-                wrap('del', pending_del)
+                wrap('del', pending_del, diff_id=(self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None))
                 del pending_del[:]
             if pending_ins:
-                wrap('ins', pending_ins)
+                wrap('ins', pending_ins, diff_id=(self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None))
                 del pending_ins[:]
 
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -232,15 +294,17 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         # formatting tags, SequenceMatcher can emit ins->del ordering. Prefer a stable
         # del->ins ordering and preserve old formatting in the deletion.
         if len(new) == 1 and new[0][0] == TEXT and any(e[0] in (START, END) for e in old):
-            self.delete(old_start, old_end)
-            self.insert(new_start, new_end)
+            with self.diff_group():
+                self.delete(old_start, old_end)
+                self.insert(new_start, new_end)
             return True
 
         # Special-case: unwrap/wrap inline wrapper (e.g. <b>/<strong>) with same text.
         # Fixes Bold -> Normal and maintains consistent Delete -> Insert.
         if self._can_unwrap_wrapper(old, new):
-            self.delete(old_start, old_end)
-            self.insert(new_start, new_end)
+            with self.diff_group():
+                self.delete(old_start, old_end)
+                self.insert(new_start, new_end)
             return True
 
         # Special-case: visual-only changes (same text, different attrs/tag).
@@ -250,10 +314,12 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             if getattr(self.config, 'visual_replace_inline', True):
                 # Render inline del->ins while keeping styles, so changes like
                 # font-size/font-weight don't turn into separate block lines.
-                self._render_visual_replace_inline(old, new)
+                with self.diff_group():
+                    self._render_visual_replace_inline(old, new)
             else:
-                self.delete(old_start, old_end)
-                self.insert(new_start, new_end)
+                with self.diff_group():
+                    self.delete(old_start, old_end)
+                    self.insert(new_start, new_end)
             return True
         
         return False
@@ -298,8 +364,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             # This is especially important for changes like:
             #   "Texto <strong>en negrita</strong>" -> "Texto normal"
             # where the deleted content must remain bold (inside <del>).
-            self.delete(old_start + idx, old_end)
-            self.insert(new_start + idx, new_end)
+            with self.diff_group():
+                self.delete(old_start + idx, old_end)
+                self.insert(new_start + idx, new_end)
             return True  # Signal to break
         
         return False
@@ -373,6 +440,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             attrs2 = Attrs(list(n_attrs))
             attrs2 = self.inject_class(attrs2, 'tagdiff_replaced')
             attrs2 |= [(QName('data-old-tag'), 'none')]
+            if getattr(self.config, 'add_diff_ids', False):
+                diff_id = self._active_diff_id() or self._new_diff_id()
+                attrs2 = self._set_attr(attrs2, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
             pos = (n_inner[0][2] if n_inner else (new_events[0][2] if new_events else old_events[0][2]))
             self.append(START, (n_tag, attrs2), pos)
             for ev in n_inner:
@@ -397,6 +467,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             span_attrs |= [(QName('data-old-tag'), o_lname)]
             span_attrs = self.inject_refattr(span_attrs, o_attrs)
             span_attrs = self.inject_class(span_attrs, 'tagdiff_replaced')
+            if getattr(self.config, 'add_diff_ids', False):
+                diff_id = self._active_diff_id() or self._new_diff_id()
+                span_attrs = self._set_attr(span_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
             self.append(START, (span_tag, span_attrs), n_text_ev[2])
             self.append(*n_text_ev)
             self.append(END, span_tag, n_text_ev[2])
@@ -425,6 +498,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
     def enter_mark_replaced(self, pos, tag, attrs, old_attrs):
         attrs = self.inject_class(attrs, 'tagdiff_replaced')
         attrs = self.inject_refattr(attrs, old_attrs)
+        if getattr(self.config, 'add_diff_ids', False):
+            diff_id = self._active_diff_id() or self._new_diff_id()
+            attrs = self._set_attr(attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
         self._stack.append(tag)
         self.append(START, (tag, attrs), pos)
 
@@ -471,7 +547,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         wrap_void = set(getattr(self.config, 'wrap_void_tag_changes_with_ins_del', ()))
         if lname in wrap_void and self._context in ('ins', 'del'):
             change_tag = QName(self._context)
-            self.append(START, (change_tag, Attrs()), pos)
+            self.append(START, (change_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
             self.enter(pos, tag, attrs)
             self._wrap_change_end_for.append((lname, change_tag))
             return True
@@ -678,7 +754,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
                                     # Delete tail (mid + old_tail)
                                     if (old_mid or old_tail) and not (new_mid or new_tail):
-                                        self.append(START, (QName('del'), Attrs()), old_text_ev[2])
+                                        self.append(START, (QName('del'), self._change_attrs(diff_id=self._active_diff_id())), old_text_ev[2])
                                         if old_mid:
                                             self.append(TEXT, _visible_ws(old_mid), old_text_ev[2])
                                         for ev in old_tail:
@@ -686,7 +762,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                         self.append(END, QName('del'), old_text_ev[2])
                                     # Insert tail (mid + new_tail)
                                     elif (new_mid or new_tail) and not (old_mid or old_tail):
-                                        self.append(START, (QName('ins'), Attrs()), new_text_ev[2])
+                                        self.append(START, (QName('ins'), self._change_attrs(diff_id=self._active_diff_id())), new_text_ev[2])
                                         if new_mid:
                                             self.append(TEXT, _visible_ws(new_mid), new_text_ev[2])
                                         for ev in new_tail:
@@ -730,11 +806,13 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             if tag == 'replace':
                 self._process_replace_opcode(self._old_atoms[i1:i2], self._new_atoms[j1:j2])
             elif tag == 'delete':
-                with self.context('del'):
-                    self.block_process(concat_events(self._old_atoms[i1:i2]))
+                with self.diff_group():
+                    with self.context('del'):
+                        self.block_process(concat_events(self._old_atoms[i1:i2]))
             elif tag == 'insert':
-                with self.context('ins'):
-                    self.block_process(concat_events(self._new_atoms[j1:j2]))
+                with self.diff_group():
+                    with self.context('ins'):
+                        self.block_process(concat_events(self._new_atoms[j1:j2]))
             else:  # equal
                 self._process_equal_opcode(self._old_atoms[i1:i2], self._new_atoms[j1:j2])
         self.leave_all()
@@ -743,7 +821,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         if self._result is None:
             self.process()
         if getattr(self.config, 'merge_adjacent_change_tags', True):
-            self._result = merge_adjacent_change_tags(self._result)
+            self._result = merge_adjacent_change_tags(self._result, config=self.config)
         return Stream(self._result)
 
     def _can_unwrap_wrapper(self, old_events, new_events):
@@ -838,7 +916,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         """Envuelve eventos internos en un wrapper inline para reemplazo visual."""
         kind_tag = QName(kind)
         wrapper_q = wrapper_tag
-        self.append(START, (kind_tag, Attrs()), pos)
+        self.append(START, (kind_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
         self.append(START, (wrapper_q, attrs), pos)
         # Render inner events verbatim (including <br>, <strong>, etc.)
         with self.context(None):
@@ -856,7 +934,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         kind_tag = QName(kind)
         wrapper_q = wrapper_tag
         self.append(START, (wrapper_q, attrs), pos)
-        self.append(START, (kind_tag, Attrs()), pos)
+        self.append(START, (kind_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
         # Emit inner events without wrapping again (we are already inside <ins>/<del>),
         # but convert <br> into a visible marker so double line breaks show an empty
         # line with ¶ even when the change is "visual-only".
@@ -1053,6 +1131,8 @@ class _EventDiffer(StreamDiffer):
         self._context = None
         self._skip_end_for = []
         self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
+        self._diff_id_counter = 0
+        self._diff_id_stack = []
 
     def get_diff_events(self):
         self.process_events()
@@ -1124,6 +1204,9 @@ class _EventDiffer(StreamDiffer):
         w_attrs2 = Attrs(list(wrapper_attrs))
         w_attrs2 = self.inject_class(w_attrs2, 'tagdiff_replaced')
         w_attrs2 |= [(QName('data-old-tag'), 'none')]
+        if getattr(self.config, 'add_diff_ids', False):
+            diff_id = self._active_diff_id() or self._new_diff_id()
+            w_attrs2 = self._set_attr(w_attrs2, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
         self.enter(self._new_events[wrapper_idx][2], wrapper_tag, w_attrs2)
         # shared TEXT once
         self.append(TEXT, old_text_ev[1], new_text_ev[2])
@@ -1164,9 +1247,11 @@ class _EventDiffer(StreamDiffer):
             if tag == 'replace':
                 self.replace(i1, i2, j1, j2)
             elif tag == 'delete':
-                self.delete(i1, i2)
+                with self.diff_group():
+                    self.delete(i1, i2)
             elif tag == 'insert':
-                self.insert(j1, j2)
+                with self.diff_group():
+                    self.insert(j1, j2)
             else:
                 self.unchanged(i1, i2)
             k += 1
