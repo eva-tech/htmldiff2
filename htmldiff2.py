@@ -25,6 +25,22 @@
 """
 from __future__ import with_statement
 
+# Layout shim: tras mover el paquete a `src/htmldiff2/`, este archivo (módulo)
+# chocaría con el paquete del mismo nombre. Para mantener compatibilidad, lo
+# convertimos en "paquete" declarando __path__ apuntando al directorio real.
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent
+_PKG_DIR = _ROOT / "src" / "htmldiff2"
+if not _PKG_DIR.exists():
+    # Fallback (layout antiguo): htmldiff2/ en la raíz
+    _PKG_DIR = _ROOT / "htmldiff2"
+
+# Si existe, hacemos que este módulo sea tratado como paquete para habilitar
+# `from htmldiff2.differ import ...`
+if _PKG_DIR.exists():
+    __path__ = [str(_PKG_DIR)]  # type: ignore[name-defined]
+
 # Re-exportar desde el módulo refactorizado para mantener compatibilidad hacia atrás
 from htmldiff2.differ import (
     StreamDiffer,
