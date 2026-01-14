@@ -53,7 +53,7 @@ but it appears that it's not using a namespace. That's fine with me
 so the tags the `StreamDiffer` adds are also unnamespaced.
 """
 
-    def __init__(self, old_stream, new_stream, config=None):
+    def __init__(self, old_stream, new_stream, config=None, diff_id_state=None):
         self.config = config or DiffConfig()
         self._old_events = list(old_stream)
         self._new_events = list(new_stream)
@@ -65,7 +65,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         self._context = None
         self._skip_end_for = []  # used for suppressing void tags on delete (e.g. <br>)
         self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
-        self._diff_id_counter = 0
+        self._diff_id_state = diff_id_state if diff_id_state is not None else [0]
         self._diff_id_stack = []
 
     @contextmanager
@@ -87,8 +87,8 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             self._diff_id_stack.pop()
 
     def _new_diff_id(self):
-        self._diff_id_counter += 1
-        return text_type(self._diff_id_counter)
+        self._diff_id_state[0] += 1
+        return text_type(self._diff_id_state[0])
 
     def _active_diff_id(self):
         if self._diff_id_stack:
@@ -604,16 +604,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         new_events = concat_events(new_atoms_slice)
         # Special-case: structural conversion to/from lists (bullets).
         #
-        # In report HTML we often ask the LLM to "convert findings into bullets":
-        #   <p>...sentences...</p>  ->  <ul><li>...</li>...</ul>
-        #
-        # A fine-grained inner event diff can produce awkward artifacts like
-        # inserting placeholder NBSPs inside the <p> and then inserting the <ul>
-        # separately, which also splits diff-id grouping (del gets id=1, ins list gets id=2).
-        #
-        # For per-change Apply/Reject we want the paragraph deletion and the list
-        # insertion to share ONE diff id. So when we detect a list structure change,
-        # we render this replace as a single grouped delete+insert at the event level.
+        # We only apply this when the replace span is essentially a single block
+        # being converted to/from a list. If the span includes multiple paragraphs,
+        # grouping the entire span would incorrectly tie unrelated edits under one id.
         def _has_list_tags(events):
             for et, d, _p in events:
                 if et == START:
@@ -623,19 +616,31 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                         return True
             return False
 
+        def _count_block_wrappers(events):
+            count = 0
+            for et, d, _p in events:
+                if et == START:
+                    t, _a = d
+                    ln = qname_localname(t)
+                    if ln in ("p", "h1", "h2", "h3", "h4", "h5", "h6"):
+                        count += 1
+            return count
+
         old_has_list = _has_list_tags(old_events)
         new_has_list = _has_list_tags(new_events)
         if old_has_list != new_has_list:
-            # Force a single diff group so <del> and <ins> share the same data-diff-id.
-            with self.diff_group():
-                with self.context("del"):
-                    self.block_process(old_events)
-                with self.context("ins"):
-                    self.block_process(new_events)
-            return
+            if _count_block_wrappers(old_events) <= 1 and _count_block_wrappers(new_events) <= 2:
+                # Force a single diff group so <del> and <ins> share the same data-diff-id.
+                with self.diff_group():
+                    with self.context("del"):
+                        self.block_process(old_events)
+                    with self.context("ins"):
+                        self.block_process(new_events)
+                return
 
         # Default: Diff the expanded events with an inner EventDiffer (no atomization)
-        inner = _EventDiffer(old_events, new_events, self.config)
+        # Pass current diff_id_state to maintain consistent IDs
+        inner = _EventDiffer(old_events, new_events, self.config, diff_id_state=self._diff_id_state)
         for ev in inner.get_diff_events():
             self.append(*ev)
 
@@ -655,7 +660,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                     self.block_process(concat_events([a_old]))
                 continue
             if a_new.get('kind') == 'block' and a_new.get('tag') in ('tr', 'td', 'th'):
-                inner = _EventDiffer(a_old['events'], a_new['events'], self.config)
+                inner = _EventDiffer(a_old['events'], a_new['events'], self.config, diff_id_state=self._diff_id_state)
                 for ev in inner.get_diff_events():
                     self.append(*ev)
             else:
@@ -681,7 +686,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                             old_txt = old_events[1][1] or u''
                             new_txt = new_events[1][1] or u''
                             if old_txt != new_txt and collapse_ws(old_txt) == collapse_ws(new_txt):
-                                inner = _EventDiffer(old_events, new_events, self.config)
+                                inner = _EventDiffer(old_events, new_events, self.config, diff_id_state=self._diff_id_state)
                                 for ev in inner.get_diff_events():
                                     self.append(*ev)
                                 continue
@@ -802,7 +807,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                         self.append(END, QName('ins'), new_text_ev[2])
                                     else:
                                         # Fallback to inner differ for anything more complex
-                                        inner = _EventDiffer(old_children, new_children, self.config)
+                                        inner = _EventDiffer(old_children, new_children, self.config, diff_id_state=self._diff_id_state)
                                         for ev in inner.get_diff_events():
                                             self.append(*ev)
 
@@ -810,13 +815,13 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                     self.leave(new_events[-1][2], new_events[-1][1])
                                     continue
 
-                            inner = _EventDiffer(old_children, new_children, self.config)
+                            inner = _EventDiffer(old_children, new_children, self.config, diff_id_state=self._diff_id_state)
                             for ev in inner.get_diff_events():
                                 self.append(*ev)
                             self.leave(new_events[-1][2], new_events[-1][1])
                             continue
 
-                        inner = _EventDiffer(old_events, new_events, self.config)
+                        inner = _EventDiffer(old_events, new_events, self.config, diff_id_state=self._diff_id_state)
                         for ev in inner.get_diff_events():
                             self.append(*ev)
                         continue
@@ -834,7 +839,56 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         if getattr(self.config, 'delete_first', True):
             opcodes = normalize_opcodes_for_delete_first(opcodes)
 
-        for tag, i1, i2, j1, j2 in opcodes:
+        def _has_list_tags(events):
+            for et, d, _p in events:
+                if et == START:
+                    t, _a = d
+                    if qname_localname(t) in ("ul", "ol", "li"):
+                        return True
+            return False
+
+        def _count_block_wrappers(events):
+            count = 0
+            for et, d, _p in events:
+                if et == START:
+                    t, _a = d
+                    if qname_localname(t) in ("p", "h1", "h2", "h3", "h4", "h5", "h6"):
+                        count += 1
+            return count
+
+        k = 0
+        while k < len(opcodes):
+            tag, i1, i2, j1, j2 = opcodes[k]
+
+            # Pair structural list conversions even when SequenceMatcher emits delete+insert
+            # as separate opcodes (not the same anchor => not normalized into replace).
+            if tag in ("delete", "insert") and k + 1 < len(opcodes):
+                tag2, i1b, i2b, j1b, j2b = opcodes[k + 1]
+                if tag == "delete" and tag2 == "insert":
+                    old_events = concat_events(self._old_atoms[i1:i2])
+                    new_events = concat_events(self._new_atoms[j1b:j2b])
+                    if _has_list_tags(old_events) != _has_list_tags(new_events):
+                        if _count_block_wrappers(old_events) <= 1 and _count_block_wrappers(new_events) <= 2:
+                            with self.diff_group():
+                                with self.context("del"):
+                                    self.block_process(old_events)
+                                with self.context("ins"):
+                                    self.block_process(new_events)
+                            k += 2
+                            continue
+                if tag == "insert" and tag2 == "delete":
+                    old_events = concat_events(self._old_atoms[i1b:i2b])
+                    new_events = concat_events(self._new_atoms[j1:j2])
+                    if _has_list_tags(old_events) != _has_list_tags(new_events):
+                        if _count_block_wrappers(old_events) <= 1 and _count_block_wrappers(new_events) <= 2:
+                            with self.diff_group():
+                                with self.context("del"):
+                                    self.block_process(old_events)
+                                with self.context("ins"):
+                                    self.block_process(new_events)
+                            k += 2
+                            continue
+
             if tag == 'replace':
                 self._process_replace_opcode(self._old_atoms[i1:i2], self._new_atoms[j1:j2])
             elif tag == 'delete':
@@ -847,6 +901,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                         self.block_process(concat_events(self._new_atoms[j1:j2]))
             else:  # equal
                 self._process_equal_opcode(self._old_atoms[i1:i2], self._new_atoms[j1:j2])
+            k += 1
         self.leave_all()
 
     def get_diff_stream(self):
@@ -1149,7 +1204,7 @@ class _EventDiffer(StreamDiffer):
     It bypasses atomization to avoid recursive re-grouping side-effects.
     """
 
-    def __init__(self, old_events, new_events, config):
+    def __init__(self, old_events, new_events, config, diff_id_state=None):
         self.config = config or DiffConfig()
         # IMPORTANT: Keep original TEXT events intact and let diff_text() handle
         # word-level granularity. Splitting TEXT here can cause insertions to
@@ -1163,7 +1218,7 @@ class _EventDiffer(StreamDiffer):
         self._context = None
         self._skip_end_for = []
         self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
-        self._diff_id_counter = 0
+        self._diff_id_state = diff_id_state if diff_id_state is not None else [0]
         self._diff_id_stack = []
 
     def get_diff_events(self):
