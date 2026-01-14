@@ -602,7 +602,39 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         """Procesa un opcode de tipo 'replace'."""
         old_events = concat_events(old_atoms_slice)
         new_events = concat_events(new_atoms_slice)
-        # Diff the expanded events with an inner EventDiffer (no atomization)
+        # Special-case: structural conversion to/from lists (bullets).
+        #
+        # In report HTML we often ask the LLM to "convert findings into bullets":
+        #   <p>...sentences...</p>  ->  <ul><li>...</li>...</ul>
+        #
+        # A fine-grained inner event diff can produce awkward artifacts like
+        # inserting placeholder NBSPs inside the <p> and then inserting the <ul>
+        # separately, which also splits diff-id grouping (del gets id=1, ins list gets id=2).
+        #
+        # For per-change Apply/Reject we want the paragraph deletion and the list
+        # insertion to share ONE diff id. So when we detect a list structure change,
+        # we render this replace as a single grouped delete+insert at the event level.
+        def _has_list_tags(events):
+            for et, d, _p in events:
+                if et == START:
+                    t, _a = d
+                    ln = qname_localname(t)
+                    if ln in ("ul", "ol", "li"):
+                        return True
+            return False
+
+        old_has_list = _has_list_tags(old_events)
+        new_has_list = _has_list_tags(new_events)
+        if old_has_list != new_has_list:
+            # Force a single diff group so <del> and <ins> share the same data-diff-id.
+            with self.diff_group():
+                with self.context("del"):
+                    self.block_process(old_events)
+                with self.context("ins"):
+                    self.block_process(new_events)
+            return
+
+        # Default: Diff the expanded events with an inner EventDiffer (no atomization)
         inner = _EventDiffer(old_events, new_events, self.config)
         for ev in inner.get_diff_events():
             self.append(*ev)
