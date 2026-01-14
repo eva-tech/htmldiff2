@@ -602,41 +602,35 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         """Procesa un opcode de tipo 'replace'."""
         old_events = concat_events(old_atoms_slice)
         new_events = concat_events(new_atoms_slice)
-        # Special-case: structural conversion to/from lists (bullets).
-        #
-        # We only apply this when the replace span is essentially a single block
-        # being converted to/from a list. If the span includes multiple paragraphs,
-        # grouping the entire span would incorrectly tie unrelated edits under one id.
-        def _has_list_tags(events):
+        
+        # SIEMPRE agrupar si hay un cambio estructural de lista (bullets)
+        # o si hay una mezcla de tags estructurales que el matcher
+        # no pudo alinear perfectamente.
+        def _has_structural_tags(events):
             for et, d, _p in events:
                 if et == START:
                     t, _a = d
                     ln = qname_localname(t)
-                    if ln in ("ul", "ol", "li"):
+                    if ln in ("ul", "ol", "li", "table", "tr", "td", "th"):
                         return True
             return False
 
-        def _count_block_wrappers(events):
-            count = 0
-            for et, d, _p in events:
-                if et == START:
-                    t, _a = d
-                    ln = qname_localname(t)
-                    if ln in ("p", "h1", "h2", "h3", "h4", "h5", "h6"):
-                        count += 1
-            return count
+        # Si el cambio involucra tags estructurales, forzamos un bloque atómico.
+        # EXCEPCIÓN: Si los átomos de ambos lados son exactamente iguales en cantidad
+        # y tipo de tag, dejamos que el inner differ lo maneje (para cambios de estilo).
+        is_pure_style_structural = (
+            len(old_atoms_slice) == len(new_atoms_slice) and
+            all(a1.get('kind') == 'block' and a2.get('kind') == 'block' and a1.get('tag') == a2.get('tag')
+                for a1, a2 in zip(old_atoms_slice, new_atoms_slice))
+        )
 
-        old_has_list = _has_list_tags(old_events)
-        new_has_list = _has_list_tags(new_events)
-        if old_has_list != new_has_list:
-            if _count_block_wrappers(old_events) <= 1 and _count_block_wrappers(new_events) <= 2:
-                # Force a single diff group so <del> and <ins> share the same data-diff-id.
-                with self.diff_group():
-                    with self.context("del"):
-                        self.block_process(old_events)
-                    with self.context("ins"):
-                        self.block_process(new_events)
-                return
+        if (_has_structural_tags(old_events) or _has_structural_tags(new_events)) and not is_pure_style_structural:
+            with self.diff_group():
+                with self.context("del"):
+                    self.block_process(old_events)
+                with self.context("ins"):
+                    self.block_process(new_events)
+            return
 
         # Default: Diff the expanded events with an inner EventDiffer (no atomization)
         # Pass current diff_id_state to maintain consistent IDs
@@ -646,10 +640,10 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
     def _process_equal_opcode(self, old_atoms_slice, new_atoms_slice):
         """Procesa un opcode de tipo 'equal' con manejo especial para tablas."""
-        # For table-related blocks, run an inner event diff even when the
+        # For table/list-related blocks, run an inner event diff even when the
         # outer atom keys are equal. This catches visual-only formatting
         # changes (e.g. <th> style, wrapping <strong style=...>) without
-        # breaking table structure.
+        # breaking structure.
         for a_old, a_new in longzip(old_atoms_slice, new_atoms_slice):
             if a_old is None:
                 with self.context(None):
@@ -659,7 +653,20 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 with self.context(None):
                     self.block_process(concat_events([a_old]))
                 continue
-            if a_new.get('kind') == 'block' and a_new.get('tag') in ('tr', 'td', 'th'):
+            
+            # Si el texto es igual pero los tags son distintos (ej: <p> -> <li>), 
+            # forzamos un bloque diff atómico con un solo ID.
+            if a_new.get('kind') == 'block' and a_old.get('kind') == 'block' and a_old['events'][0][1][0] != a_new['events'][0][1][0]:
+                with self.diff_group():
+                    with self.context('del'):
+                        self.block_process(a_old['events'])
+                    with self.context('ins'):
+                        self.block_process(a_new['events'])
+                continue
+
+            is_structural = a_new.get('kind') == 'block' and a_new.get('tag') in ('tr', 'td', 'th', 'ul', 'ol', 'li')
+            
+            if is_structural:
                 inner = _EventDiffer(a_old['events'], a_new['events'], self.config, diff_id_state=self._diff_id_state)
                 for ev in inner.get_diff_events():
                     self.append(*ev)
@@ -1078,21 +1085,33 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
         old_l = qname_localname(old_tag)
         new_l = qname_localname(new_tag)
+        # Structural tags (td, th) must remain the outermost tag to keep HTML valid.
+        is_structural = (old_l in ('td', 'th') and new_l in ('td', 'th'))
+
         # Preserve actual wrapper tags when possible:
         # - inline wrappers: span/strong/em...
         # - block wrappers: p/h1..h6 (titles/paragraphs)
-        old_wrap = old_tag if (old_l in INLINE_FORMATTING_TAGS or old_l in BLOCK_WRAPPER_TAGS) else QName('span')
-        new_wrap = new_tag if (new_l in INLINE_FORMATTING_TAGS or new_l in BLOCK_WRAPPER_TAGS) else QName('span')
+        # - structural: td/th
+        old_wrap = old_tag if (old_l in INLINE_FORMATTING_TAGS or old_l in BLOCK_WRAPPER_TAGS or old_l in ('td', 'th')) else QName('span')
+        new_wrap = new_tag if (new_l in INLINE_FORMATTING_TAGS or new_l in BLOCK_WRAPPER_TAGS or new_l in ('td', 'th')) else QName('span')
 
-        if old_l in BLOCK_WRAPPER_TAGS:
-            self._wrap_block_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
+        if is_structural:
+            # Emit the new structural tag once
+            self.append(START, (new_tag, new_attrs), pos)
+            # Then emit del/ins of content
+            self._wrap_inline_visual_replace('del', QName('span'), old_attrs, old_inner, pos)
+            self._wrap_inline_visual_replace('ins', QName('span'), new_attrs, new_inner, pos)
+            self.append(END, new_tag, pos)
         else:
-            self._wrap_inline_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
+            if old_l in BLOCK_WRAPPER_TAGS:
+                self._wrap_block_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
+            else:
+                self._wrap_inline_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
 
-        if new_l in BLOCK_WRAPPER_TAGS:
-            self._wrap_block_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
-        else:
-            self._wrap_inline_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
+            if new_l in BLOCK_WRAPPER_TAGS:
+                self._wrap_block_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
+            else:
+                self._wrap_inline_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
 
         for ev in tws_new:
             self.append(*ev)

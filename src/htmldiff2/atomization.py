@@ -61,6 +61,16 @@ def create_block_atom_key(lname, block_events, attrs, config, visual_tags):
         # Rows: key only by visible text so style changes inside cells don't
         # force a whole-row replace; inner diff will mark changes.
         return (lname, block_text)
+    elif lname in ('li', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+        # Normalize structural blocks to just their text content for the 
+        # initial alignment. This allows a paragraph to match a list item
+        # if the text is identical, while the tag change is handled later.
+        # Include a 'block' marker to distinguish from raw text atoms.
+        return ('block', block_text)
+    elif lname in ('ul', 'ol'):
+        # Force these containers to always be 'equal' in the outer matcher
+        # so we always run an inner diff on their children.
+        return (lname,)
     elif lname in visual_tags:
         return (lname, block_text, attrs_signature(attrs, config), 
                 structure_signature(block_events, config))

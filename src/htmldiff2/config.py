@@ -32,13 +32,14 @@ class DiffConfig(object):
     linebreak_marker = u'\u00b6'  # ¶
 
     # Visual/attribute diff
-    track_attrs = ('style', 'class', 'src', 'href')
+    track_attrs = ('style', 'class', 'src', 'href', 'ref', 'data-ref')
     # Tags where "visual-only" changes (attrs/tag changes with same text) should be
     # rendered as a visible diff (del then ins). Excludes structural containers.
     visual_container_tags = (
         'span', 'div', 'p',
         'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
         'strong', 'b', 'em', 'i', 'u',
+        'td', 'th',
     )
     # Tags to atomize as blocks for alignment. Intentionally excludes generic
     # container <div> to avoid swallowing large sections like report-content.

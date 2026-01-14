@@ -90,15 +90,16 @@ def normalize_inline_wrapper_opcodes(opcodes, old_events, new_events):
 def normalize_inline_wrapper_tag_change_opcodes(opcodes, old_events, new_events, config):
     """
     Normalize patterns like:
-      replace(START <span> -> <strong>), equal(TEXT), replace(END <span> -> <strong>)
+      replace(START <span> -> <span style="...">), equal(TEXT), equal(END <span>)
     into a single replace over the full wrapper subtree so we can render it as
     a visible visual diff (del->ins).
     """
     allowed = set(getattr(config, 'visual_container_tags', ()))
-    # Focus on wrappers where tag-change should be rendered as a visible diff:
+    # Focus on wrappers where tag-change or attr-change should be rendered as a visible diff:
     # - inline formatting wrappers
     # - title/paragraph wrappers
-    wrappers = set(['span', 'strong', 'b', 'em', 'i', 'u', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+    # - table cells (if added to visual_container_tags)
+    wrappers = set(['span', 'strong', 'b', 'em', 'i', 'u', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'td', 'th'])
     wrappers &= allowed | wrappers
 
     out = []
@@ -108,7 +109,13 @@ def normalize_inline_wrapper_tag_change_opcodes(opcodes, old_events, new_events,
             t1, a1, a2, b1, b2 = opcodes[i]
             t2, c1, c2, d1, d2 = opcodes[i + 1]
             t3, e1, e2, f1, f2 = opcodes[i + 2]
-            if t1 == 'replace' and t2 == 'equal' and t3 == 'replace' and (a2 - a1) == 1 and (b2 - b1) == 1 and (e2 - e1) == 1 and (f2 - f1) == 1:
+            
+            # Case 1: Tag name changed (replace, equal, replace)
+            # Case 2: Attributes changed but tag name same (replace, equal, equal)
+            is_tag_replace = (t1 == 'replace' and t2 == 'equal' and (t3 == 'replace' or t3 == 'equal') and 
+                              (a2 - a1) == 1 and (b2 - b1) == 1 and (e2 - e1) == 1 and (f2 - f1) == 1)
+            
+            if is_tag_replace:
                 ev_start_old = old_events[a1]
                 ev_start_new = new_events[b1]
                 ev_end_old = old_events[e1]
@@ -157,8 +164,8 @@ def should_force_visual_replace(old_events, new_events, config):
 
     old_txt = extract_text_from_events(old_events)
     new_txt = extract_text_from_events(new_events)
-    if not old_txt or not new_txt:
-        return False
+    # We allow visual replace even for empty tags if they have visual attribute changes.
+    # (e.g. <h2 style="..."> </h2> -> <h2 style="..."> </h2>)
     if collapse_ws(old_txt) != collapse_ws(new_txt):
         return False
 
@@ -174,6 +181,8 @@ def should_force_visual_replace(old_events, new_events, config):
     # the paragraph gets highlighted as deleted/inserted (EdenAI report case).
     if structure_signature(old_events, config) != structure_signature(new_events, config):
         if old_lname in INLINE_FORMATTING_TAGS or new_lname in INLINE_FORMATTING_TAGS:
+            return True
+        if old_lname in ('td', 'th'):
             return True
         if old_lname in BLOCK_WRAPPER_TAGS or new_lname in BLOCK_WRAPPER_TAGS:
             return False
