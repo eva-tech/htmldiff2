@@ -17,4 +17,6 @@ Pipfile*
 libdiff/
 demo_viewer/
 ws_tester/
+eden_ws_tester/
 
+.specstory/**

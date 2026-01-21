@@ -520,6 +520,21 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 self.append(END, tag, last_pos)
         del self._stack[:]
 
+    def block_process(self, events):
+        for event in events:
+            event_type, data, pos = event
+            if event_type == START:
+                tag, attrs = data
+                if self._handle_start_event_in_block(tag, attrs, pos):
+                    continue
+            elif event_type == END:
+                if self._handle_end_event_in_block(data, pos):
+                    continue
+            elif event_type == TEXT:
+                self._handle_text_event_in_block(data, pos)
+            else:
+                self.append(event_type, data, pos)
+
     def _handle_start_event_in_block(self, tag, attrs, pos):
         """Maneja eventos START dentro de block_process."""
         lname = qname_localname(tag)
@@ -540,6 +555,22 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 self.append(START, (tag, attrs), pos)
                 self.append(END, tag, pos)
                 self._skip_end_for.append(lname)
+            return True
+
+        # For structural tags that shouldn't be wrapped in <ins>/<del> (to keep HTML valid
+        # and avoid "ghost" cells/bullets), we inject a special class into the tag itself.
+        structural_tags = ('table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'ul', 'ol', 'li')
+        if lname in structural_tags and self._context in ('ins', 'del'):
+            suffix = 'added' if self._context == 'ins' else 'deleted'
+            attrs = self.inject_class(attrs, 'tagdiff_' + suffix)
+            if getattr(self.config, 'add_diff_ids', False):
+                diff_id = self._active_diff_id() or self._new_diff_id()
+                attrs = self._set_attr(attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+            
+            # Use enter() which preserves the tag but with our new class.
+            # We don't return True here because we WANT the children to be processed
+            # normally (wrapped in <ins>/<del> for text) to maintain visual consistency.
+            self.enter(pos, tag, attrs)
             return True
 
         # Wrap void/non-textual elements (e.g. <img>) with <ins>/<del> so the
@@ -582,21 +613,6 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 self.mark_text(pos, data, self._context)
                 return
         self.append(TEXT, data, pos)
-
-    def block_process(self, events):
-        for event in events:
-            event_type, data, pos = event
-            if event_type == START:
-                tag, attrs = data
-                if self._handle_start_event_in_block(tag, attrs, pos):
-                    continue
-            elif event_type == END:
-                if self._handle_end_event_in_block(data, pos):
-                    continue
-            elif event_type == TEXT:
-                self._handle_text_event_in_block(data, pos)
-            else:
-                self.append(event_type, data, pos)
 
     def _process_replace_opcode(self, old_atoms_slice, new_atoms_slice):
         """Procesa un opcode de tipo 'replace'."""
