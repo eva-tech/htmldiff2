@@ -81,6 +81,43 @@ def run_regressions():
     assert re.search(r"<ins[^>]*>C</ins>", out), out
     assert not re.search(r"<del[^>]*>A</del>", out), out
 
+    # Tables: removing an intermediate column must delete the correct cells,
+    # even when there are duplicate values that can confuse alignment.
+    old = """<table>
+<thead><tr>
+<th>Localización</th>
+<th>Diámetro Actual (mm)</th>
+<th>Diámetro Previo (mm)</th>
+<th>Cambio (%)</th>
+<th>Fecha Previa</th>
+</tr></thead>
+<tbody>
+<tr><td>LSD</td><td>11</td><td>10</td><td>+10%</td><td>Enero 2024</td></tr>
+<tr><td>LII</td><td>8</td><td>8</td><td>0%</td><td>Enero 2024</td></tr>
+</tbody>
+</table>"""
+    new = """<table>
+<thead><tr>
+<th>Localización</th>
+<th>Diámetro Actual (mm)</th>
+<th>Cambio (%)</th>
+<th>Fecha Previa</th>
+</tr></thead>
+<tbody>
+<tr><td>LSD</td><td>11</td><td>+10%</td><td>Enero 2024</td></tr>
+<tr><td>LII</td><td>8</td><td>0%</td><td>Enero 2024</td></tr>
+</tbody>
+</table>"""
+    out = htmldiff2.render_html_diff(old, new)
+    # The deleted column header
+    assert re.search(r'<th[^>]*\bclass="[^"]*\btagdiff_deleted\b[^"]*"[^>]*>.*?<del[^>]*>Diámetro Previo \(mm\)</del>.*?</th>', out, flags=re.S), out
+    # The deleted column data (both rows)
+    assert out.count('class="tagdiff_deleted"') >= 3, out
+    assert re.search(r'<td[^>]*\bclass="[^"]*\btagdiff_deleted\b[^"]*"[^>]*>.*?<del[^>]*>10</del>.*?</td>', out, flags=re.S), out
+    # Ensure we did NOT accidentally delete the "Cambio (%)" column/header
+    assert not re.search(r'<th[^>]*\bclass="[^"]*\btagdiff_deleted\b[^"]*"[^>]*>\s*Cambio \(%\)\s*</th>', out), out
+    assert not re.search(r'>\s*\+10%\s*<', out.split('tagdiff_deleted')[0]), out  # sanity: +10% stays outside deleted cells
+
     # Whitespace-only change inside a single TEXT node should be visible
     out = htmldiff2.render_html_diff("<p>Texto con   espacios</p>", "<p>Texto con espacios</p>")
     _assert_contains(out, "<del")

@@ -16,6 +16,10 @@ def build_block_tags_set(config):
     if getattr(config, 'enable_list_atomization', True):
         block_tags |= set(['li'])
     if getattr(config, 'enable_table_atomization', True):
+        # Atomize rows and cells so the outer matcher doesn't drift across rows.
+        # NOTE: we still need row-aware logic when diffing <tr> blocks (see differ.py),
+        # because event-level diff inside a row can misalign cells when a column is
+        # removed/inserted and there are duplicate values.
         block_tags |= set(['td', 'th', 'tr'])
     if getattr(config, 'enable_inline_wrapper_atomization', True):
         # Helps treat formatting wrapper removal/addition as a cohesive unit.
