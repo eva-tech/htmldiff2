@@ -21,7 +21,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -mvenv .venv
-        python -m pip install .
+        python -m pip install ".[dev]"
 
     - name: Run tests
-      run: python test.py
+      run: pytest
