@@ -10,6 +10,55 @@ from .utils import (
 )
 
 
+def _first_n_cell_texts_from_tr_events(tr_events, n=2):
+    """
+    Extract visible text from the first N direct child <td>/<th> cells of a <tr>.
+
+    This helps row alignment when columns are added/removed: the "row identity"
+    usually lives in the first columns (e.g. Hallazgo / Descripción), while later
+    columns may be the ones being removed (e.g. Localización).
+    """
+    texts = []
+    cell_idx = -1
+    in_cell = False
+    cell_depth = 0
+    buf = []
+
+    for et, d, _p in tr_events:
+        if et == START:
+            tag, _attrs = d
+            lname = qname_localname(tag)
+            if lname in ("td", "th"):
+                if not in_cell:
+                    # entering a direct cell
+                    cell_idx += 1
+                    in_cell = True
+                    cell_depth = 1
+                    buf = []
+                else:
+                    # nested cell tag (unlikely) - track depth
+                    cell_depth += 1
+        elif et == END:
+            lname = qname_localname(d)
+            if in_cell and lname in ("td", "th"):
+                cell_depth -= 1
+                if cell_depth == 0:
+                    # leaving the direct cell
+                    if cell_idx < n:
+                        texts.append(collapse_ws("".join(buf)))
+                        if len(texts) >= n:
+                            break
+                    in_cell = False
+        elif et == TEXT:
+            if in_cell and cell_idx < n:
+                buf.append(d or "")
+
+    # Ensure length n (pad with empty) for stable keys
+    while len(texts) < n:
+        texts.append("")
+    return tuple(texts[:n])
+
+
 def build_block_tags_set(config):
     """Construye el conjunto de tags que deben ser atomizados como bloques."""
     block_tags = set()
@@ -62,8 +111,11 @@ def create_block_atom_key(lname, block_events, attrs, config, visual_tags):
         return (lname, block_text, attrs_signature(attrs, config), 
                 structure_signature(block_events, config))
     elif lname == 'tr':
-        # Rows: key only by visible text so style changes inside cells don't
-        # force a whole-row replace; inner diff will mark changes.
+        # Rows: key by the first columns (typically the stable identity of the row),
+        # so column deletions/insertions in later columns still match the same row.
+        c0, c1 = _first_n_cell_texts_from_tr_events(block_events, n=2)
+        if c0 or c1:
+            return (lname, c0, c1)
         return (lname, block_text)
     elif lname in ('li', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
         # Normalize structural blocks to just their text content for the 

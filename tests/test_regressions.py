@@ -223,6 +223,336 @@ def test_table_remove_column_with_many_empty_cells_deletes_correct_index():
     assert not _has_class(target[4], "tagdiff_deleted"), out
 
 
+def test_remove_localizacion_column_full_ticket_example():
+    # Exact ticket example (table + wrapper). Doctor instruction: remove "Localización" column.
+    old = """<div>
+<div ref="1">
+<div>
+<div ref="1"><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/>
+<p>MOTIVO DEL ESTUDIO: Dolor abdominal, con antecedente de apendicetomía hace 6 meses y colecistectomía hace 10 días. <br/>TÉCNICA: Se realiza estudio tomográfico helicoidal desde las bases pulmonares hasta la sínfisis del pubis en fase simple, arterial, venosa y de eliminación tras la administración de medio de contraste oral (agua); se post-procesan diversas reconstrucciones planares observando los siguientes hallazgos:  <br/>HALLAZGOS: </p>
+<table>
+<tbody>
+<tr>
+<td>Hallazgo</td>
+<td>Descripción</td>
+<td>Localización</td>
+<td>Medidas</td>
+<td>Volumen</td>
+</tr>
+<tr>
+<td>Colección</td>
+<td>Con burbujas de gas en tejido celular subcutáneo, asociada a mínima colección.</td>
+<td>Línea media y paramedial derecha, infraumbilical</td>
+<td>1.8x1.5x1cm</td>
+<td> </td>
+</tr>
+<tr>
+<td>Colección</td>
+<td>Con pared delgada que presenta reforzamiento tras la administración de medio de contraste.</td>
+<td>Fosa ilíaca derecha sobre lecho quirúrgico pericecal</td>
+<td>8.3x2.4x4cm</td>
+<td>19cc</td>
+</tr>
+<tr>
+<td>Cambios en pared abdominal</td>
+<td>Aumento en la densidad del espesor graso, burbujas de gas en tejido celular subcutáneo.</td>
+<td>Línea media y paramedial derecha, infraumbilical</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Atelectasias</td>
+<td>Discretas</td>
+<td>Basales bilaterales</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Hígado</td>
+<td>Patrón de atenuación heterogéneo con zonas de densidad 10-14UH en fase simple, sin realces anormales posterior al contraste intravenoso.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Vía biliar</td>
+<td>No dilatada.</td>
+<td>Intra y extrahepática</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Lecho vesicular</td>
+<td>Grapas quirúrgicas.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Intestino delgado</td>
+<td>Dilatación continua de hasta 4 cm. Disminución de su luz en segmento del íleon de 4 cm de longitud, por efecto de masa de colección pericecal. Tránsito intestinal conservado hacia el resto del íleon y colon. Reforzamiento de la pared intestinal simétrico, no se identifican engrosamientos de pared ni obstrucciones intrínsecas.</td>
+<td>Íleon</td>
+<td>4 cm (segmento afectado)</td>
+<td> </td>
+</tr>
+<tr>
+<td>Colon</td>
+<td>Trayecto redundante, con residuo y gas en su interior de predominio en colon ascendente y transverso.</td>
+<td>Ascendente y transverso</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Vasos mesentéricos</td>
+<td>Ingurgitación.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Neumoperitoneo</td>
+<td>Aisladas burbujas de gas en cavidad abdominal.</td>
+<td>Cavidad abdominal</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Vejiga</td>
+<td>Pobre repleción de paredes regulares y contenido homogéneo.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Próstata</td>
+<td>Morfología conservada.</td>
+<td> </td>
+<td>Eje transverso de 3.7cm</td>
+<td> </td>
+</tr>
+<tr>
+<td>Estructuras óseas</td>
+<td>Mineralización conservada, sin remodelación.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Páncreas, glándulas suprarrenales y bazo</td>
+<td>De situación, tamaño y forma habituales.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Riñones</td>
+<td>De tamaño conservado, el parénquima concentra y elimina de forma simétrica y homogénea el medio de contraste; no hay dilatación pielocalicial ni imágenes ocupativas.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Unión esófago-gástrica</td>
+<td>Se localiza por debajo del diafragma.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Estómago</td>
+<td>Distendido con agua, con presencia de sonda en su interior, de paredes regulares.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Duodeno</td>
+<td>De trayecto habitual.</td>
+<td> </td>
+<td> </td>
+<td> </td>
+</tr>
+</tbody>
+</table>
+<br/>IMPRESIÓN:  <br/>Hallazgos tomográficos compatibles con colección en fosa iliaca derecha sobre lecho quirúrgico pericecal, con volumen aproximado de 19cc.  <br/>Obstrucción intestinal parcial en segmento de ilion, probablemente secundaria a compresión por colección referida, no se descartan adherencias por esta modalidad de imagen.  <br/>Atelectasias basales bilaterales.  <br/>Neumoperitoneo de tipo posquirúrgico como posibilidad.  <br/>Cambios posquirúrgicos en pared abdominal.  <br/>Resto como se comenta en texto.</div>
+</div>
+</div>
+</div>"""
+
+    # Same as `old` but removing the "Localización" column (3rd column) from each row.
+    new = """<div>
+<div ref="1">
+<div>
+<div ref="1"><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/><br/>
+<p>MOTIVO DEL ESTUDIO: Dolor abdominal, con antecedente de apendicetomía hace 6 meses y colecistectomía hace 10 días. <br/>TÉCNICA: Se realiza estudio tomográfico helicoidal desde las bases pulmonares hasta la sínfisis del pubis en fase simple, arterial, venosa y de eliminación tras la administración de medio de contraste oral (agua); se post-procesan diversas reconstrucciones planares observando los siguientes hallazgos:  <br/>HALLAZGOS: </p>
+<table>
+<tbody>
+<tr>
+<td>Hallazgo</td>
+<td>Descripción</td>
+<td>Medidas</td>
+<td>Volumen</td>
+</tr>
+<tr>
+<td>Colección</td>
+<td>Con burbujas de gas en tejido celular subcutáneo, asociada a mínima colección.</td>
+<td>1.8x1.5x1cm</td>
+<td> </td>
+</tr>
+<tr>
+<td>Colección</td>
+<td>Con pared delgada que presenta reforzamiento tras la administración de medio de contraste.</td>
+<td>8.3x2.4x4cm</td>
+<td>19cc</td>
+</tr>
+<tr>
+<td>Cambios en pared abdominal</td>
+<td>Aumento en la densidad del espesor graso, burbujas de gas en tejido celular subcutáneo.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Atelectasias</td>
+<td>Discretas</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Hígado</td>
+<td>Patrón de atenuación heterogéneo con zonas de densidad 10-14UH en fase simple, sin realces anormales posterior al contraste intravenoso.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Vía biliar</td>
+<td>No dilatada.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Lecho vesicular</td>
+<td>Grapas quirúrgicas.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Intestino delgado</td>
+<td>Dilatación continua de hasta 4 cm. Disminución de su luz en segmento del íleon de 4 cm de longitud, por efecto de masa de colección pericecal. Tránsito intestinal conservado hacia el resto del íleon y colon. Reforzamiento de la pared intestinal simétrico, no se identifican engrosamientos de pared ni obstrucciones intrínsecas.</td>
+<td>4 cm (segmento afectado)</td>
+<td> </td>
+</tr>
+<tr>
+<td>Colon</td>
+<td>Trayecto redundante, con residuo y gas en su interior de predominio en colon ascendente y transverso.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Vasos mesentéricos</td>
+<td>Ingurgitación.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Neumoperitoneo</td>
+<td>Aisladas burbujas de gas en cavidad abdominal.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Vejiga</td>
+<td>Pobre repleción de paredes regulares y contenido homogéneo.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Próstata</td>
+<td>Morfología conservada.</td>
+<td>Eje transverso de 3.7cm</td>
+<td> </td>
+</tr>
+<tr>
+<td>Estructuras óseas</td>
+<td>Mineralización conservada, sin remodelación.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Páncreas, glándulas suprarrenales y bazo</td>
+<td>De situación, tamaño y forma habituales.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Riñones</td>
+<td>De tamaño conservado, el parénquima concentra y elimina de forma simétrica y homogénea el medio de contraste; no hay dilatación pielocalicial ni imágenes ocupativas.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Unión esófago-gástrica</td>
+<td>Se localiza por debajo del diafragma.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Estómago</td>
+<td>Distendido con agua, con presencia de sonda en su interior, de paredes regulares.</td>
+<td> </td>
+<td> </td>
+</tr>
+<tr>
+<td>Duodeno</td>
+<td>De trayecto habitual.</td>
+<td> </td>
+<td> </td>
+</tr>
+</tbody>
+</table>
+<br/>IMPRESIÓN:  <br/>Hallazgos tomográficos compatibles con colección en fosa iliaca derecha sobre lecho quirúrgico pericecal, con volumen aproximado de 19cc.  <br/>Obstrucción intestinal parcial en segmento de ilion, probablemente secundaria a compresión por colección referida, no se descartan adherencias por esta modalidad de imagen.  <br/>Atelectasias basales bilaterales.  <br/>Neumoperitoneo de tipo posquirúrgico como posibilidad.  <br/>Cambios posquirúrgicos en pared abdominal.  <br/>Resto como se comenta en texto.</div>
+</div>
+</div>
+</div>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+    root = _parse_fragment(out)
+
+    # Header "Localización" must be deleted (3rd cell) and must not drift to "Volumen".
+    header_trs = [el for el in root.iter() if _local_name(el.tag) == "tr"]
+    assert header_trs, out
+    header = header_trs[0]
+    header_tds = [c for c in header if _local_name(c.tag) == "td"]
+    assert len(header_tds) == 5, out
+    assert _text_content(header_tds[2]) == "Localización", out
+    assert _has_class(header_tds[2], "tagdiff_deleted"), out
+    assert not _has_class(header_tds[4], "tagdiff_deleted"), out
+
+    # Row with non-empty location: ensure the location cell is the deleted one.
+    coleccion_row = None
+    for tr in header_trs[1:]:
+        tds = [c for c in tr if _local_name(c.tag) == "td"]
+        if tds and _text_content(tds[0]) == "Colección":
+            if "infraumbilical" in _text_content(tds[2]):
+                coleccion_row = tds
+                break
+    assert coleccion_row is not None, out
+    assert _has_class(coleccion_row[2], "tagdiff_deleted"), out
+    assert "infraumbilical" in _text_content(coleccion_row[2]), out
+
+    # Row with empty trailing cells: ensure the deleted one is still the 3rd cell (Localización),
+    # not the last empty column.
+    higado_row = None
+    for tr in header_trs[1:]:
+        tds = [c for c in tr if _local_name(c.tag) == "td"]
+        if tds and _text_content(tds[0]) == "Hígado":
+            higado_row = tds
+            break
+    assert higado_row is not None, out
+    assert len(higado_row) == 5, out
+    assert _has_class(higado_row[2], "tagdiff_deleted"), out
+    assert not _has_class(higado_row[4], "tagdiff_deleted"), out
+
+
 def test_bullets_paragraph_to_list_conversion_is_grouped_and_structural():
     # From scripts/repro_bullets_group.py
     before = """
