@@ -679,6 +679,110 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         old_keys = [self._cell_key(c) for c in old_cells]
         new_keys = [self._cell_key(c) for c in new_cells]
 
+        def _diff_cell_pair(old_cell, new_cell):
+            """Diff one old/new cell (td/th), preserving structure."""
+            if self._cell_key(old_cell) == self._cell_key(new_cell):
+                inner = _EventDiffer(old_cell['events'], new_cell['events'], self.config, diff_id_state=self._diff_id_state)
+                for ev in inner.get_diff_events():
+                    self.append(*ev)
+                return
+            with self.diff_group():
+                with self.context('del'):
+                    self.block_process(old_cell['events'])
+                with self.context('ins'):
+                    self.block_process(new_cell['events'])
+
+        def _best_single_delete_index(oldk, newk):
+            """
+            Choose which index to delete from old (len(old)=len(new)+1) to best
+            preserve left-to-right alignment. Important when many cells are empty
+            (empty keys are identical and would otherwise drift).
+            """
+            best_k = 0
+            best_score = -1
+            new_len = len(newk)
+            for k in range(len(oldk)):
+                score = 0
+                # prefix
+                for i0 in range(min(k, new_len)):
+                    if oldk[i0] == newk[i0]:
+                        score += 1
+                # suffix: old[k+1:] aligns with new[k:]
+                for i0 in range(k, new_len):
+                    if oldk[i0 + 1] == newk[i0]:
+                        score += 1
+                if score > best_score:
+                    best_score = score
+                    best_k = k
+            return best_k
+
+        def _best_single_insert_index(oldk, newk):
+            """
+            Choose which index to insert into old (len(new)=len(old)+1) by selecting
+            the index in new that best preserves alignment (i.e. delete that index
+            from new yields best match).
+            """
+            best_k = 0
+            best_score = -1
+            old_len = len(oldk)
+            for k in range(len(newk)):
+                score = 0
+                # prefix
+                for i0 in range(min(k, old_len)):
+                    if oldk[i0] == newk[i0]:
+                        score += 1
+                # suffix: old[k:] aligns with new[k+1:]
+                for i0 in range(k, old_len):
+                    if oldk[i0] == newk[i0 + 1]:
+                        score += 1
+                if score > best_score:
+                    best_score = score
+                    best_k = k
+            return best_k
+
+        # Special-case: single-column removal/addition. Do a positional alignment
+        # with a stable chosen index, instead of key-based matching that can drift
+        # across identical empty cells.
+        if len(old_cells) == len(new_cells) + 1:
+            k = _best_single_delete_index(old_keys, new_keys)
+            # diff cells before k
+            for idx in range(k):
+                if idx < len(new_cells):
+                    _diff_cell_pair(old_cells[idx], new_cells[idx])
+                else:
+                    with self.diff_group():
+                        with self.context('del'):
+                            self.block_process(old_cells[idx]['events'])
+            # delete the removed column cell
+            with self.diff_group():
+                with self.context('del'):
+                    self.block_process(old_cells[k]['events'])
+            # diff remaining cells after k (shifted left by one)
+            for idx in range(k, len(new_cells)):
+                _diff_cell_pair(old_cells[idx + 1], new_cells[idx])
+            self.append(*old_tr_events[-1])
+            return
+
+        if len(new_cells) == len(old_cells) + 1:
+            k = _best_single_insert_index(old_keys, new_keys)
+            # diff cells before k
+            for idx in range(k):
+                if idx < len(old_cells):
+                    _diff_cell_pair(old_cells[idx], new_cells[idx])
+                else:
+                    with self.diff_group():
+                        with self.context('ins'):
+                            self.block_process(new_cells[idx]['events'])
+            # insert the added column cell
+            with self.diff_group():
+                with self.context('ins'):
+                    self.block_process(new_cells[k]['events'])
+            # diff remaining cells after k (shifted right by one in new)
+            for idx in range(k, len(old_cells)):
+                _diff_cell_pair(old_cells[idx], new_cells[idx + 1])
+            self.append(*old_tr_events[-1])
+            return
+
         i = 0
         j = 0
         while i < len(old_cells) or j < len(new_cells):

@@ -189,6 +189,40 @@ def test_table_remove_intermediate_column_with_duplicates_marks_correct_column()
     assert "8" in deleted_texts, out
 
 
+def test_table_remove_column_with_many_empty_cells_deletes_correct_index():
+    # Regression: when multiple trailing cells are empty, we must still delete the
+    # intended column (not drift and delete the last empty one).
+    old = """<table>
+<tbody>
+<tr><td>Hallazgo</td><td>Descripción</td><td>Localización</td><td>Medidas</td><td>Volumen</td></tr>
+<tr><td>Hígado</td><td>Texto</td><td> </td><td> </td><td> </td></tr>
+</tbody>
+</table>"""
+    new = """<table>
+<tbody>
+<tr><td>Hallazgo</td><td>Descripción</td><td>Medidas</td><td>Volumen</td></tr>
+<tr><td>Hígado</td><td>Texto</td><td> </td><td> </td></tr>
+</tbody>
+</table>"""
+    out = htmldiff2.render_html_diff(old, new)
+    root = _parse_fragment(out)
+
+    # Find the "Hígado" row and ensure the *third* cell is the deleted one.
+    trs = [el for el in root.iter() if _local_name(el.tag) == "tr"]
+    target = None
+    for tr in trs:
+        tds = [c for c in tr if _local_name(c.tag) == "td"]
+        if not tds:
+            continue
+        if _text_content(tds[0]) == "Hígado":
+            target = tds
+            break
+    assert target is not None, out
+    assert len(target) == 5, out  # old structure preserved, one cell marked deleted
+    assert _has_class(target[2], "tagdiff_deleted"), out
+    assert not _has_class(target[4], "tagdiff_deleted"), out
+
+
 def test_bullets_paragraph_to_list_conversion_is_grouped_and_structural():
     # From scripts/repro_bullets_group.py
     before = """
