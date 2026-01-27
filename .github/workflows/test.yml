@@ -1,6 +1,7 @@
 name: Tests
 on:
-  push
+  push:
+  workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
