@@ -69,7 +69,9 @@ def build_block_tags_set(config):
         # NOTE: we still need row-aware logic when diffing <tr> blocks (see differ.py),
         # because event-level diff inside a row can misalign cells when a column is
         # removed/inserted and there are duplicate values.
-        block_tags |= set(['td', 'th', 'tr'])
+        # Also atomize <table> so table start/end cannot be split across opcodes
+        # when the LLM restyles the table tag (border/padding/etc).
+        block_tags |= set(['td', 'th', 'tr', 'table'])
     if getattr(config, 'enable_inline_wrapper_atomization', True):
         # Helps treat formatting wrapper removal/addition as a cohesive unit.
         block_tags |= set(['b', 'strong', 'i', 'em'])

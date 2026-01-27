@@ -646,6 +646,100 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             i += 1
         return cells
 
+    def _extract_tr_blocks(self, table_events):
+        """Extract all <tr> blocks found within a <table> event slice (thead/tbody included)."""
+        blocks = []
+        i = 0
+        n = len(table_events)
+        while i < n:
+            etype, data, _pos = table_events[i]
+            if etype == START:
+                tag, _attrs = data
+                lname = qname_localname(tag)
+                if lname == "tr":
+                    depth = 1
+                    j = i + 1
+                    while j < n and depth:
+                        t2, d2, _p2 = table_events[j]
+                        if t2 == START and qname_localname(d2[0]) == "tr":
+                            depth += 1
+                        elif t2 == END and qname_localname(d2) == "tr":
+                            depth -= 1
+                        j += 1
+                    blocks.append(table_events[i:j])
+                    i = j
+                    continue
+            i += 1
+        return blocks
+
+    def _row_key(self, tr_events):
+        """Key to align rows across table changes (based on first 2 cells' text)."""
+        cells = self._extract_direct_tr_cells(tr_events)
+        if not cells:
+            return ("", "")
+        def _cell_txt(c):
+            return collapse_ws(extract_text_from_events(c["events"]))
+        c0 = _cell_txt(cells[0]) if len(cells) > 0 else ""
+        c1 = _cell_txt(cells[1]) if len(cells) > 1 else ""
+        return (c0, c1)
+
+    def _diff_table_by_rows(self, old_table_events, new_table_events):
+        """
+        Diff a table by aligning rows (<tr>) and diffing each row by cells.
+
+        This keeps the output HTML valid even when the LLM restyles the table/tag
+        attributes, and ensures column removals are handled by our row-aware
+        `_diff_tr_by_cells` logic.
+        """
+        if not old_table_events or not new_table_events:
+            inner = _EventDiffer(old_table_events, new_table_events, self.config, diff_id_state=self._diff_id_state)
+            for ev in inner.get_diff_events():
+                self.append(*ev)
+            return
+
+        # Emit the table wrapper from the OLD side (keeps structure valid; inner diffs
+        # will mark style/attr changes at cell level).
+        self.append(*old_table_events[0])
+
+        old_rows = self._extract_tr_blocks(old_table_events)
+        new_rows = self._extract_tr_blocks(new_table_events)
+        old_keys = [self._row_key(r) for r in old_rows]
+        new_keys = [self._row_key(r) for r in new_rows]
+
+        matcher = SequenceMatcher(None, old_keys, new_keys)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                for oi, nj in zip(range(i1, i2), range(j1, j2)):
+                    self._diff_tr_by_cells(old_rows[oi], new_rows[nj])
+            elif tag == "delete":
+                with self.diff_group():
+                    with self.context("del"):
+                        for oi in range(i1, i2):
+                            self.block_process(old_rows[oi])
+            elif tag == "insert":
+                with self.diff_group():
+                    with self.context("ins"):
+                        for nj in range(j1, j2):
+                            self.block_process(new_rows[nj])
+            else:  # replace
+                # Pair rows positionally where possible
+                n = min(i2 - i1, j2 - j1)
+                for k in range(n):
+                    self._diff_tr_by_cells(old_rows[i1 + k], new_rows[j1 + k])
+                if (i2 - i1) > n:
+                    with self.diff_group():
+                        with self.context("del"):
+                            for oi in range(i1 + n, i2):
+                                self.block_process(old_rows[oi])
+                if (j2 - j1) > n:
+                    with self.diff_group():
+                        with self.context("ins"):
+                            for nj in range(j1 + n, j2):
+                                self.block_process(new_rows[nj])
+
+        # Emit closing </table> from OLD wrapper.
+        self.append(*old_table_events[-1])
+
     def _cell_key(self, cell):
         """Key used to align table cells inside a row."""
         lname = cell['tag']
@@ -676,12 +770,25 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
         old_cells = self._extract_direct_tr_cells(old_tr_events)
         new_cells = self._extract_direct_tr_cells(new_tr_events)
-        old_keys = [self._cell_key(c) for c in old_cells]
-        new_keys = [self._cell_key(c) for c in new_cells]
+        # Two key types:
+        # - align key (text-only): used to keep column alignment stable even if the LLM
+        #   adds styling/attributes (border/padding) everywhere.
+        # - full key (includes attrs/structure): used only when deciding whether we
+        #   need to render a replace vs. let EventDiffer mark attribute diffs.
+        def _align_key(cell):
+            return (
+                cell["tag"],
+                collapse_ws(extract_text_from_events(cell["events"])),
+            )
+
+        old_align = [_align_key(c) for c in old_cells]
+        new_align = [_align_key(c) for c in new_cells]
 
         def _diff_cell_pair(old_cell, new_cell):
             """Diff one old/new cell (td/th), preserving structure."""
-            if self._cell_key(old_cell) == self._cell_key(new_cell):
+            # If the visible text is the same, prefer an inner diff so style/attrs
+            # changes do NOT shift column alignment.
+            if _align_key(old_cell) == _align_key(new_cell):
                 inner = _EventDiffer(old_cell['events'], new_cell['events'], self.config, diff_id_state=self._diff_id_state)
                 for ev in inner.get_diff_events():
                     self.append(*ev)
@@ -744,7 +851,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         # with a stable chosen index, instead of key-based matching that can drift
         # across identical empty cells.
         if len(old_cells) == len(new_cells) + 1:
-            k = _best_single_delete_index(old_keys, new_keys)
+            k = _best_single_delete_index(old_align, new_align)
             # diff cells before k
             for idx in range(k):
                 if idx < len(new_cells):
@@ -764,7 +871,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             return
 
         if len(new_cells) == len(old_cells) + 1:
-            k = _best_single_insert_index(old_keys, new_keys)
+            k = _best_single_insert_index(old_align, new_align)
             # diff cells before k
             for idx in range(k):
                 if idx < len(old_cells):
@@ -786,7 +893,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         i = 0
         j = 0
         while i < len(old_cells) or j < len(new_cells):
-            if i < len(old_cells) and j < len(new_cells) and old_keys[i] == new_keys[j]:
+            if i < len(old_cells) and j < len(new_cells) and old_align[i] == new_align[j]:
                 # Same cell -> inner diff to catch formatting/text changes.
                 inner = _EventDiffer(old_cells[i]['events'], new_cells[j]['events'], self.config, diff_id_state=self._diff_id_state)
                 for ev in inner.get_diff_events():
@@ -879,6 +986,19 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             self._diff_tr_by_cells(old_atoms_slice[0]['events'], new_atoms_slice[0]['events'])
             return
 
+        # Special-case: whole table blocks should be diffed by rows/cells (keeps HTML valid
+        # even if table attributes change and avoids splitting table start/end across opcodes).
+        if (
+            len(old_atoms_slice) == 1
+            and len(new_atoms_slice) == 1
+            and old_atoms_slice[0].get("kind") == "block"
+            and new_atoms_slice[0].get("kind") == "block"
+            and old_atoms_slice[0].get("tag") == "table"
+            and new_atoms_slice[0].get("tag") == "table"
+        ):
+            self._diff_table_by_rows(old_atoms_slice[0]["events"], new_atoms_slice[0]["events"])
+            return
+
         if (_has_structural_tags(old_events) or _has_structural_tags(new_events)) and not is_pure_style_structural:
             with self.diff_group():
                 with self.context("del"):
@@ -919,11 +1039,13 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                         self.block_process(a_new['events'])
                 continue
 
-            is_structural = a_new.get('kind') == 'block' and a_new.get('tag') in ('tr', 'td', 'th', 'ul', 'ol', 'li')
+            is_structural = a_new.get('kind') == 'block' and a_new.get('tag') in ('table', 'tr', 'td', 'th', 'ul', 'ol', 'li')
             
             if is_structural:
                 if a_new.get('tag') == 'tr':
                     self._diff_tr_by_cells(a_old['events'], a_new['events'])
+                elif a_new.get('tag') == 'table':
+                    self._diff_table_by_rows(a_old['events'], a_new['events'])
                 else:
                     inner = _EventDiffer(a_old['events'], a_new['events'], self.config, diff_id_state=self._diff_id_state)
                     for ev in inner.get_diff_events():

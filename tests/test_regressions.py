@@ -633,6 +633,217 @@ def test_td_style_change_preserves_table_and_has_ids():
     assert re.search(r'\bdata-diff-id="[^"]+"', out)
 
 
+def test_remove_localizacion_with_style_changes_does_not_delete_medidas():
+    # Reported: LLM restyles the table (adds border/padding), and removing Localización
+    # ends up also deleting Medidas/Volumen when accepting changes. That means the diff
+    # incorrectly tagged Medidas as tagdiff_deleted. We must NOT do that.
+    old = """<table ref="2">
+<thead>
+<tr>
+<th ref="3">Hallazgo</th>
+<th ref="3">Descripción</th>
+<th ref="3">Localización</th>
+<th ref="3">Medidas / Volumen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td ref="3">Pared Abdominal y Tejidos Blandos</td>
+<td ref="3">Texto</td>
+<td ref="3">General</td>
+<td ref="3">N/A</td>
+</tr>
+</tbody>
+</table>"""
+
+    new = """<table border="1" style="border-collapse: collapse; width: 100%;">
+<thead>
+<tr>
+<th style="padding: 8px; text-align: left;">Hallazgo</th>
+<th style="padding: 8px; text-align: left;">Descripción</th>
+<th style="padding: 8px; text-align: left;">Medidas / Volumen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="padding: 8px; text-align: left;">Pared Abdominal y Tejidos Blandos</td>
+<td style="padding: 8px; text-align: left;">Texto</td>
+<td style="padding: 8px; text-align: left;">N/A</td>
+</tr>
+</tbody>
+</table>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+    root = _parse_fragment(out)
+
+    # Look at the header row and validate column tagging without relying on
+    # exact unicode rendering in assertion output.
+    trs = [el for el in root.iter() if _local_name(el.tag) == "tr"]
+    assert trs, out
+    header = trs[0]
+    ths = [c for c in header if _local_name(c.tag) == "th"]
+    assert len(ths) >= 3, out
+
+    # The deleted header must be "Localización" and ONLY that one.
+    deleted_ths = [th for th in ths if _has_class(th, "tagdiff_deleted")]
+    assert len(deleted_ths) == 1, out
+    assert "localiz" in _text_content(deleted_ths[0]).lower(), out
+
+    # "Medidas / Volumen" must not be deleted.
+    medidas_ths = [th for th in ths if "medidas" in _text_content(th).lower()]
+    assert medidas_ths, out
+    assert all(not _has_class(th, "tagdiff_deleted") for th in medidas_ths), out
+
+
+def test_remove_localizacion_exact_reported_example_with_restyle():
+    """
+    Exact reported example: doctor asks to remove Localización and the LLM also
+    restyles the table (border/padding). Accepting changes must NOT remove
+    "Medidas / Volumen", so it must not be tagged tagdiff_deleted.
+    """
+    old = """<div>
+<div ref="1">
+<div>
+<h2><strong>TC DE ABDOMEN Y PELVIS CON CONTRASTE</strong></h2>
+<br/>
+<p><strong>INFORMACIÓN CLÍNICA:</strong> Paciente pediátrico (0 años, género no especificado) con dolor abdominal, antecedente de apendicetomía hace 6 meses y colecistectomía hace 10 días.</p>
+<br/>
+<p><strong>TÉCNICA:</strong> Se realizó estudio tomográfico helicoidal desde las bases pulmonares hasta la sínfisis del pubis en fase simple, arterial, venosa y de eliminación tras la administración de medio de contraste oral (agua). Se post-procesaron diversas reconstrucciones planares.</p>
+<br/>
+<p><strong>COMPARACIÓN:</strong> No disponible.</p>
+<br/>
+<p><strong>HALLAZGOS:</strong></p>
+<p>Se presenta la siguiente tabla resumen de los hallazgos:</p>
+<p> </p>
+<table ref="2">
+<thead>
+<tr>
+<th ref="3">Hallazgo</th>
+<th ref="3">Descripción</th>
+<th ref="3">Localización</th>
+<th ref="3">Medidas / Volumen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td ref="3">Pared Abdominal y Tejidos Blandos</td>
+<td ref="3">Aumento en la densidad del espesor graso subcutáneo con imágenes de burbujas de gas. Mínima colección asociada.</td>
+<td ref="3">Línea media y paramedial derecha, infraumbilical.</td>
+<td ref="3">Colección: 1.8x1.5x1 cm</td>
+</tr>
+<tr>
+<td ref="3">Estructuras Óseas</td>
+<td ref="3">Mineralización conservada, sin remodelación ósea aparente.</td>
+<td ref="3">General</td>
+<td ref="3">N/A</td>
+</tr>
+<tr>
+<td ref="3">Tracto Digestivo</td>
+<td ref="3">Estómago con sonda. Intestino delgado con dilatación hasta 4 cm.</td>
+<td ref="3">Íleon (segmento afectado), General</td>
+<td ref="3">Dilatación ID: hasta 4 cm</td>
+</tr>
+<tr>
+<td ref="3">Fosa Ilíaca Derecha / Región Pericecal</td>
+<td ref="3">Colección con pared delgada que presenta reforzamiento tras contraste.</td>
+<td ref="3">Fosa ilíaca derecha / Región pericecal</td>
+<td ref="3">8.3x2.4x4 cm / 19 cc</td>
+</tr>
+<tr>
+<td ref="3">Próstata</td>
+<td ref="3">Morfología conservada.</td>
+<td ref="3">General</td>
+<td ref="3">Eje transverso: 3.7 cm</td>
+</tr>
+</tbody>
+</table>
+<br/>
+<p><strong>IMPRESIÓN:</strong></p>
+<ol>
+<li>Resto de los hallazgos como se describen en el texto.</li>
+</ol>
+</div>
+</div>
+</div>"""
+
+    # The LLM's "after": same content, but Localización column removed AND table restyled.
+    new = """<div>
+<div>
+<div>
+<h2><strong>TC DE ABDOMEN Y PELVIS CON CONTRASTE</strong></h2>
+<br/>
+<p><strong>INFORMACIÓN CLÍNICA:</strong> Paciente pediátrico (0 años, género no especificado) con dolor abdominal, antecedente de apendicetomía hace 6 meses y colecistectomía hace 10 días.</p>
+<br/>
+<p><strong>TÉCNICA:</strong> Se realizó estudio tomográfico helicoidal desde las bases pulmonares hasta la sínfisis del pubis en fase simple, arterial, venosa y de eliminación tras la administración de medio de contraste oral (agua). Se post-procesaron diversas reconstrucciones planares.</p>
+<br/>
+<p><strong>COMPARACIÓN:</strong> No disponible.</p>
+<br/>
+<p><strong>HALLAZGOS:</strong></p>
+<p>Se presenta la siguiente tabla resumen de los hallazgos:</p>
+<p> </p>
+<table border="1" style="border-collapse: collapse; width: 100%;">
+<thead>
+<tr>
+<th style="padding: 8px; text-align: left;">Hallazgo</th>
+<th style="padding: 8px; text-align: left;">Descripción</th>
+<th style="padding: 8px; text-align: left;">Medidas / Volumen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="padding: 8px; text-align: left;">Pared Abdominal y Tejidos Blandos</td>
+<td style="padding: 8px; text-align: left;">Aumento en la densidad del espesor graso subcutáneo con imágenes de burbujas de gas. Mínima colección asociada.</td>
+<td style="padding: 8px; text-align: left;">Colección: 1.8x1.5x1 cm</td>
+</tr>
+<tr>
+<td style="padding: 8px; text-align: left;">Estructuras Óseas</td>
+<td style="padding: 8px; text-align: left;">Mineralización conservada, sin remodelación ósea aparente.</td>
+<td style="padding: 8px; text-align: left;">N/A</td>
+</tr>
+<tr>
+<td style="padding: 8px; text-align: left;">Tracto Digestivo</td>
+<td style="padding: 8px; text-align: left;">Estómago con sonda. Intestino delgado con dilatación hasta 4 cm.</td>
+<td style="padding: 8px; text-align: left;">Dilatación ID: hasta 4 cm</td>
+</tr>
+<tr>
+<td style="padding: 8px; text-align: left;">Fosa Ilíaca Derecha / Región Pericecal</td>
+<td style="padding: 8px; text-align: left;">Colección con pared delgada que presenta reforzamiento tras contraste.</td>
+<td style="padding: 8px; text-align: left;">8.3x2.4x4 cm / 19 cc</td>
+</tr>
+<tr>
+<td style="padding: 8px; text-align: left;">Próstata</td>
+<td style="padding: 8px; text-align: left;">Morfología conservada.</td>
+<td style="padding: 8px; text-align: left;">Eje transverso: 3.7 cm</td>
+</tr>
+</tbody>
+</table>
+<br/>
+<p><strong>IMPRESIÓN:</strong></p>
+<ol>
+<li>Resto de los hallazgos como se describen en el texto.</li>
+</ol>
+</div>
+</div>
+</div>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+    root = _parse_fragment(out)
+
+    # Ensure "Medidas / Volumen" is NOT tagged deleted anywhere in header.
+    medidas_ths = [th for th in root.iter() if _local_name(th.tag) == "th" and "medidas" in _text_content(th).lower()]
+    assert medidas_ths, out
+    assert all(not _has_class(th, "tagdiff_deleted") for th in medidas_ths), out
+
+    # Ensure "Localización" is the one being deleted.
+    deleted_headers = [
+        th
+        for th in root.iter()
+        if _local_name(th.tag) == "th" and _has_class(th, "tagdiff_deleted")
+    ]
+    assert deleted_headers, out
+    assert any("localiz" in _text_content(th).lower() for th in deleted_headers), out
+
+
 def test_default_config_tracks_refs_and_td_th_visual():
     cfg = DiffConfig()
     assert "ref" in cfg.track_attrs
