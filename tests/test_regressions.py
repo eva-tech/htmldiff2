@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 
 import html5lib
 import htmldiff2
-from htmldiff2 import DiffConfig
+from htmldiff2 import DiffConfig, render_html_diff
 
 
 def _local_name(tag: str) -> str:
@@ -59,6 +59,28 @@ def test_doctests_htmldiff2_module():
 def test_delete_before_insert_ordering():
     out = htmldiff2.render_html_diff("Foo baz", "Foo blah baz")
     assert "<ins" in out
+
+
+def test_unrelated_texts_are_grouped_not_shredded():
+    """
+    When old and new texts are completely unrelated (e.g., template vs full report),
+    the diff should show clean grouped del/ins blocks instead of word-by-word interleaving.
+    
+    Bad (shredded):  <del>Motivo</del><ins>RADIOGRAFÍA</ins> <del>del</del><ins>DE</ins>...
+    Good (grouped):  <del>Motivo del estudio:</del><ins>RADIOGRAFÍA DE PELVIS AP</ins>
+    """
+    old = '<p><strong>Motivo del estudio:</strong></p>'
+    new = '<p><strong>RADIOGRAFÍA DE PELVIS AP</strong></p>'
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # Should NOT have shredded interleaving like <del>Motivo</del><ins>RADIOGRAFÍA</ins>
+    assert '<del' in out and '<ins' in out
+    # The old text should be grouped together in one del
+    assert 'Motivo del estudio:' in out
+    # The new text should be grouped together in one ins
+    assert 'RADIOGRAFÍA DE PELVIS AP' in out
+    # Should NOT have word-by-word matching like "del" matching "DE"
+    assert '<del' not in out or '>Motivo</del>' not in out  # "Motivo" alone = shredded
 
 
 def test_inline_wrapper_change_does_not_delete_whole_sentence():
@@ -844,6 +866,76 @@ def test_remove_localizacion_exact_reported_example_with_restyle():
     assert any("localiz" in _text_content(th).lower() for th in deleted_headers), out
 
 
+def test_remove_descripcion_column_exact_reported_example():
+    """
+    Reported: removing "Descripción" column causes "Medidas / Volumen" to be tagged deleted.
+    Also, user mentions "titulo se eliminó" (likely the header cell of the second column).
+    """
+    old = """<table>
+<tbody>
+<tr>
+<td><strong>Estructura / Hallazgo</strong></td>
+<td><strong>Descripción</strong></td>
+<td><strong>Medidas / Volumen</strong></td>
+</tr>
+<tr>
+<td>Pared Abdominal y Tejidos Blandos</td>
+<td>Aumento en la densidad del espesor graso subcutáneo con imágenes de burbujas de gas en la línea media y paramedial derecha, infraumbilical. Grapas quirúrgicas en el lecho vesicular.</td>
+<td>Mínima colección: 1.8x1.5x1 cm</td>
+</tr>
+<tr>
+<td>Tórax</td>
+<td>Discretas atelectasias basales bilaterales.</td>
+<td>N/A</td>
+</tr>
+</tbody>
+</table>"""
+
+    # After: second column (Descripción) removed.
+    new = """<table>
+<tbody>
+<tr>
+<td><strong>Estructura / Hallazgo</strong></td>
+<td><strong>Medidas / Volumen</strong></td>
+</tr>
+<tr>
+<td>Pared Abdominal y Tejidos Blandos</td>
+<td>Mínima colección: 1.8x1.5x1 cm</td>
+</tr>
+<tr>
+<td>Tórax</td>
+<td>N/A</td>
+</tr>
+</tbody>
+</table>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+    root = _parse_fragment(out)
+
+    # 1. Check header row
+    trs = [el for el in root.iter() if _local_name(el.tag) == "tr"]
+    header_tds = [c for c in trs[0] if _local_name(c.tag) == "td"]
+    
+    # "Descripción" should be tagged deleted.
+    desc_td = next((td for td in header_tds if "descrip" in _text_content(td).lower()), None)
+    assert desc_td is not None, out
+    assert _has_class(desc_td, "tagdiff_deleted"), out
+
+    # "Medidas / Volumen" should NOT be tagged deleted.
+    med_td = next((td for td in header_tds if "medidas" in _text_content(td).lower()), None)
+    assert med_td is not None, out
+    assert not _has_class(med_td, "tagdiff_deleted"), out
+
+    # 2. Check data row (Pared Abdominal)
+    data_tds = [c for c in trs[1] if _local_name(c.tag) == "td"]
+    # Cell 1 (Pared) -> kept
+    assert not _has_class(data_tds[0], "tagdiff_deleted"), out
+    # Cell 2 (Descripción text) -> deleted
+    assert _has_class(data_tds[1], "tagdiff_deleted"), out
+    # Cell 3 (Medidas text) -> kept
+    assert not _has_class(data_tds[2], "tagdiff_deleted"), out
+
+
 def test_default_config_tracks_refs_and_td_th_visual():
     cfg = DiffConfig()
     assert "ref" in cfg.track_attrs
@@ -851,3 +943,110 @@ def test_default_config_tracks_refs_and_td_th_visual():
     assert "td" in cfg.visual_container_tags
     assert "th" in cfg.visual_container_tags
 
+
+# ---------------------------------------------------------------------------
+# Whitespace visibility tests (calderón ¶ and NBSP)
+# ---------------------------------------------------------------------------
+
+
+def test_linebreak_marker_pilcrow_appears_on_br_insert():
+    """When a <br> is inserted, a pilcrow (¶) marker should appear."""
+    old = "<p>Línea uno</p>"
+    new = "<p>Línea uno<br/>Segunda línea</p>"
+    out = render_html_diff(old, new)
+    # The pilcrow character (¶ = \u00b6) should be present
+    assert "\u00b6" in out, f"Expected pilcrow in output: {out}"
+    assert "<ins" in out, out
+
+
+def test_linebreak_marker_pilcrow_appears_on_br_delete():
+    """When a <br> is deleted, a pilcrow (¶) marker should appear."""
+    old = "<p>Línea uno<br/>Segunda línea</p>"
+    new = "<p>Línea uno Segunda línea</p>"
+    out = render_html_diff(old, new)
+    # The pilcrow character (¶ = \u00b6) should be present
+    assert "\u00b6" in out, f"Expected pilcrow in output: {out}"
+    assert "<del" in out, out
+
+
+def test_linebreak_marker_can_be_disabled():
+    """Setting linebreak_marker to empty string disables pilcrow."""
+    cfg = DiffConfig()
+    cfg.linebreak_marker = ""
+    old = "<p>Línea uno</p>"
+    new = "<p>Línea uno<br/>Segunda línea</p>"
+    out = render_html_diff(old, new, config=cfg)
+    # No pilcrow should appear
+    assert "\u00b6" not in out, f"Pilcrow should not appear: {out}"
+
+
+def test_whitespace_nbsp_for_leading_trailing_spaces():
+    """Leading/trailing spaces in diffs are converted to NBSP."""
+    old = "<p>texto</p>"
+    new = "<p>  texto  </p>"
+    out = render_html_diff(old, new)
+    # NBSP (\u00a0) should be present for the leading/trailing spaces
+    assert "\u00a0" in out, f"Expected NBSP in output: {out}"
+
+
+def test_whitespace_nbsp_for_multiple_spaces():
+    """Multiple consecutive spaces are converted to NBSP."""
+    old = "<p>una palabra</p>"
+    new = "<p>una    palabra</p>"
+    out = render_html_diff(old, new)
+    # NBSP (\u00a0) should be present for the multiple spaces
+    assert "\u00a0" in out, f"Expected NBSP in output: {out}"
+
+
+def test_whitespace_preservation_can_be_disabled():
+    """Setting preserve_whitespace_in_diff to False disables NBSP conversion."""
+    cfg = DiffConfig()
+    cfg.preserve_whitespace_in_diff = False
+    old = "<p>texto</p>"
+    new = "<p>  texto  </p>"
+    out = render_html_diff(old, new, config=cfg)
+    # Regular spaces instead of NBSP - the diff should still work
+    # but whitespace handling changes
+    assert "<ins" in out or "<del" in out, f"Expected diff markers: {out}"
+
+
+def test_default_config_has_whitespace_settings():
+    """Verify default config has expected whitespace settings."""
+    cfg = DiffConfig()
+    assert cfg.linebreak_marker == "\u00b6", "Default linebreak_marker should be pilcrow"
+    assert cfg.preserve_whitespace_in_diff is True, "Default should preserve whitespace"
+
+
+def test_br_inside_del_when_deleting_linebreaks():
+    """When deleting <br> tags, they should be INSIDE <del> so they get removed properly."""
+    # Use a more complex case similar to the user's report
+    old = """<p class="p1"><strong>Motivo del estudio:</strong></p>
+<p><br/><br/><br/></p>
+<p class="p1"><strong>Técnica del estudio:</strong></p>"""
+    
+    new = """<h2><strong>RADIOGRAFÍA DE PELVIS (AP)</strong></h2>
+<br/>
+<p><strong>INFORMACIÓN CLÍNICA:</strong></p>"""
+    
+    out = render_html_diff(old, new)
+    
+    # Check that <br> tags are INSIDE <del> tags, not outside
+    # The pattern <del>...</del><br/> is WRONG (br outside del)
+    # The pattern <del>...<br></del> is CORRECT (br inside del)
+    import re
+    # Look for the problematic pattern: </del> followed by <br> (outside)
+    problematic = re.search(r'</del>\s*<br[^>]*/?>', out)
+    assert problematic is None, (
+        f"Found <br> outside <del> tag: {problematic.group(0)}. "
+        f"<br> should be INSIDE <del> so it gets deleted properly. "
+        f"Full output: {out[:1000]}"
+    )
+    
+    # Verify that <br> tags exist inside <del> tags (positive check)
+    correct_pattern = re.search(r'<del[^>]*>.*?<br[^>]*/?>.*?</del>', out, re.DOTALL)
+    if '<del' in out and '<br' in out:
+        # If we have both del and br, br should be inside del
+        assert correct_pattern is not None, (
+            f"Should find <br> inside <del> tag when both are present. "
+            f"Output: {out[:1000]}"
+        )

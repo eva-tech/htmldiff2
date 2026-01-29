@@ -28,6 +28,30 @@ from .normalization import (
 from .parser import longzip
 
 
+class InsensitiveSequenceMatcher(SequenceMatcher):
+    """
+    SequenceMatcher that ignores very small matching blocks.
+    
+    This prevents "shredded" diffs where unrelated texts get word-by-word
+    interleaving due to incidental small matches (e.g., "del" matching "DE").
+    """
+    
+    def __init__(self, isjunk=None, a='', b='', threshold=2):
+        super().__init__(isjunk, a, b)
+        self.threshold = threshold
+    
+    def get_matching_blocks(self):
+        # Dynamically adjust threshold based on sequence size to avoid
+        # over-filtering on very short sequences.
+        size = min(len(self.a), len(self.b))
+        effective_threshold = min(self.threshold, size // 4)
+        
+        blocks = super().get_matching_blocks()
+        # Keep blocks larger than threshold, or the sentinel (size=0) at the end.
+        return [block for block in blocks 
+                if block[2] > effective_threshold or block[2] == 0]
+
+
 def diff_genshi_stream(old_stream, new_stream):
     """Renders a creole diff for two texts."""
     differ = StreamDiffer(old_stream, new_stream)
@@ -202,7 +226,8 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
     def diff_text(self, pos, old_text, new_text):
         old = self.text_split(old_text)
         new = self.text_split(new_text)
-        matcher = SequenceMatcher(None, old, new)
+        threshold = getattr(self.config, 'sequence_match_threshold', 2)
+        matcher = InsensitiveSequenceMatcher(None, old, new, threshold=threshold)
 
         def wrap(tag, words, diff_id=None):
             return self.mark_text(pos, u''.join(words), tag, diff_id=diff_id)
@@ -546,14 +571,18 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 self.mark_text(pos, marker, 'ins')
                 self.enter(pos, tag, attrs)
             else:
-                # <del>¶</del><br> (render a line break so double-<br> deletions
-                # show an empty line with a visible marker)
-                self.mark_text(pos, marker, 'del')
-                # Render a visual <br> even though it's deleted, so removed
-                # blank lines are visible (and consecutive <br><br> show a
-                # standalone ¶ line).
+                # <del>¶<br></del> (put <br> inside <del> so it gets deleted properly)
+                # Create <del> tag manually so we can put <br> inside before closing
+                change_tag = QName('del')
+                change_attrs = self._change_attrs(diff_id=self._active_diff_id())
+                self.append(START, (change_tag, change_attrs), pos)
+                # Put the marker text inside
+                self.append(TEXT, marker, pos)
+                # Put the <br> INSIDE the <del> tag
                 self.append(START, (tag, attrs), pos)
                 self.append(END, tag, pos)
+                # Now close the <del>
+                self.append(END, change_tag, pos)
                 self._skip_end_for.append(lname)
             return True
 

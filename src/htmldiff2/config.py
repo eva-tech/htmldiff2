@@ -79,5 +79,9 @@ class DiffConfig(object):
     add_diff_ids = True
     diff_id_attr = 'data-diff-id'
 
+    # Threshold for InsensitiveSequenceMatcher: matches with fewer tokens than this
+    # are ignored, preventing "shredded" diffs on unrelated texts.
+    sequence_match_threshold = 2
+
 
 
