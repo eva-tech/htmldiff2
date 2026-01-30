@@ -83,5 +83,10 @@ class DiffConfig(object):
     # are ignored, preventing "shredded" diffs on unrelated texts.
     sequence_match_threshold = 2
 
+    # Global similarity threshold: if SequenceMatcher.ratio() of the full texts is
+    # below this value, skip structural matching and render as bulk del + ins.
+    # Set to 0 to disable this feature.
+    bulk_replace_similarity_threshold = 0.3
+
 
 

@@ -1083,6 +1083,13 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 old_events = a_old.get('events') or []
                 new_events = a_new.get('events') or []
 
+                # Visual-only attribute changes (same text, different style/class/attrs)
+                # should still produce a visible diff even when atom keys match.
+                if old_events != new_events and self._can_visual_container_replace(old_events, new_events):
+                    with self.diff_group():
+                        self._render_visual_replace_inline(old_events, new_events)
+                    continue
+
                 # Whitespace-only text changes can be hidden by atomization keys
                 # (we intentionally collapse whitespace for alignment). If this atom
                 # is a simple container with a single TEXT child, and the only
@@ -1247,6 +1254,24 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
     def process(self):
         self._result = []
+        
+        # Global similarity check: if texts are too different, do bulk del + ins
+        # instead of granular structural matching (avoids interleaved shredding).
+        bulk_threshold = getattr(self.config, 'bulk_replace_similarity_threshold', 0.3)
+        if bulk_threshold > 0:
+            old_text = extract_text_from_events(self._old_events)
+            new_text = extract_text_from_events(self._new_events)
+            if old_text.strip() and new_text.strip():
+                ratio = SequenceMatcher(None, old_text, new_text).ratio()
+                if ratio < bulk_threshold:
+                    # Texts are too different - render as bulk delete then bulk insert
+                    with self.diff_group():
+                        with self.context('del'):
+                            self.block_process(self._old_events)
+                        with self.context('ins'):
+                            self.block_process(self._new_events)
+                    return
+        
         # Run SequenceMatcher on atom keys (better alignment for lists/tables/text).
         old_keys = [a['key'] for a in self._old_atoms]
         new_keys = [a['key'] for a in self._new_atoms]
