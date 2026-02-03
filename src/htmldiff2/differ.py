@@ -601,6 +601,17 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             # normally (wrapped in <ins>/<del> for text) to maintain visual consistency.
             self.enter(pos, tag, attrs)
             return True
+            
+        # Wrap block wrappers (p, h1, etc.) so the whole element is deleted/inserted.
+        # This prevents "empty tags" remaining after accept/reject (e.g. <p><del>...</del></p> -> <p></p>).
+        if lname in BLOCK_WRAPPER_TAGS and self._context in ('ins', 'del'):
+            change_tag = QName(self._context)
+            self.append(START, (change_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
+            self.enter(pos, tag, attrs)
+            # Store context to restore effectively (we clear it so nested text isn't double wrapped)
+            self._wrap_change_end_for.append((lname, change_tag, self._context))
+            self._context = None 
+            return True
 
         # Wrap void/non-textual elements (e.g. <img>) with <ins>/<del> so the
         # change is visible even though there is no TEXT to mark.
@@ -609,7 +620,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             change_tag = QName(self._context)
             self.append(START, (change_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
             self.enter(pos, tag, attrs)
-            self._wrap_change_end_for.append((lname, change_tag))
+            self._wrap_change_end_for.append((lname, change_tag, None))
             return True
 
         self.enter(pos, tag, attrs)
@@ -622,11 +633,13 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             self._skip_end_for.pop()
             return True
 
-        # Close wrapper <ins>/<del> for wrapped void elements after their END.
+        # Close wrapper <ins>/<del> for wrapped void or block elements after their END.
         if self._wrap_change_end_for and self._wrap_change_end_for[-1][0] == lname:
-            _lname, change_tag = self._wrap_change_end_for.pop()
+            _lname, change_tag, restore_ctx = self._wrap_change_end_for.pop()
             self.leave(pos, data)
             self.append(END, change_tag, pos)
+            if restore_ctx is not None:
+                self._context = restore_ctx
             return True
 
         self.leave(pos, data)

@@ -83,6 +83,47 @@ def test_unrelated_texts_are_grouped_not_shredded():
     assert '<del' not in out or '>Motivo</del>' not in out  # "Motivo" alone = shredded
 
 
+def test_block_wrapper_wrapping_in_bulk_replace():
+    """
+    Ensure block wrappers (p, h1, etc.) are wrapped BY the del/ins tag
+    when doing a bulk replace, so that accepting the change deletes the whole element.
+    
+    Old behavior: <p><del>...</del></p> (leaves empty <p> on accept)
+    New behavior: <del><p>...</p></del> (removes <p> on accept)
+    """
+    old = '<p>ZZZ</p>'
+    new = '<h1>AAA</h1>'
+    
+    # Use bulk replace threshold (defaults to 0.3, these strings are very different)
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # Check that del wraps p
+    assert '<del' in out
+    assert '<del' in out and '<p>' in out
+    # We want to see <del...><p...
+    # Regex or simple string check. Since attributes might be present, check order.
+    del_idx = out.find('<del')
+    p_idx = out.find('<p', del_idx)
+    del_close_idx = out.find('</del>', p_idx)
+    p_close_idx = out.find('</p>', p_idx)
+    
+    assert del_idx != -1
+    assert p_idx != -1
+    assert p_idx > del_idx, "<p> should be after <del>"
+    assert del_close_idx > p_close_idx, "</del> should be after </p>"
+    
+    # Check that ins wraps h1
+    ins_idx = out.find('<ins')
+    h1_idx = out.find('<h1', ins_idx)
+    ins_close_idx = out.find('</ins>', h1_idx)
+    h1_close_idx = out.find('</h1>', h1_idx)
+    
+    assert ins_idx != -1
+    assert h1_idx != -1
+    assert h1_idx > ins_idx, "<h1> should be after <ins>"
+    assert ins_close_idx > h1_close_idx, "</ins> should be after </h1>"
+
+
 def test_inline_wrapper_change_does_not_delete_whole_sentence():
     before = """<div class="report-content">
             <p>
