@@ -683,6 +683,40 @@ def test_ul_style_change_is_replaced_not_nested():
     assert out.count('<ul') == 1
 
 
+def test_paragraphs_converted_to_list_wrapped_correctly():
+    """
+    Test that when converting <p> blocks to a <ul> list, the deleted <p> elements
+    are wrapped in synthetic <li> tags inside the <ul>, rather than being
+    direct children of <ul> (which is invalid HTML).
+    """
+    old = """
+    <p>Item 1</p>
+    <p>Item 2</p>
+    """
+    new = """
+    <ul>
+    <li>Item 1</li>
+    <li>Item 2</li>
+    </ul>
+    """
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # We expect <ul ...> ... <li class="tagdiff_deleted"><del><p>Item 1</p></del></li> ... </ul>
+    # Or similar, but NOT <ul ...> <del> ... </del> </ul>
+    
+    # Check that <del> is NOT a direct child of <ul> (approximate check)
+    # Correct: <li ...><del>...
+    assert '<li class="tagdiff_deleted"><del>' in out or '<li class="tagdiff_added"><del>' in out
+    
+    # Verify we don't have the invalid structure
+    # This regex looks for <ul ...> then immediate <del
+    import re
+    assert not re.search(r'<ul[^>]*>\s*<del', out), "Found <del> directly inside <ul>"
+    
+    # Verify content is preserved
+    assert "Item 1" in out and "Item 2" in out
+
+
 def test_table_remove_description_column_marks_deleted_cells():
     # From scripts/repro_table_remove_description_column_exact.py
     old = """<table>

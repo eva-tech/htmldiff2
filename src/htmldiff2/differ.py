@@ -606,6 +606,24 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         # This prevents "empty tags" remaining after accept/reject (e.g. <p><del>...</del></p> -> <p></p>).
         if lname in BLOCK_WRAPPER_TAGS and self._context in ('ins', 'del'):
             change_tag = QName(self._context)
+            
+            # Special Check: Are we inserting/deleting a block element directly inside a List?
+            # e.g. <ul><del><p>...</p></del></ul> is invalid. It should be <ul><li><del><p>...</p></del></li></ul>.
+            # Convert context-less blocks into proper list items if needed.
+            if self._stack and qname_localname(self._stack[-1]) in ('ul', 'ol') and lname != 'li':
+                # Inject Synthetic LI wrapper
+                li_tag = QName('li')
+                li_attrs = Attrs([
+                    (QName('class'), 'tagdiff_added' if self._context == 'ins' else 'tagdiff_deleted')
+                ])
+                if getattr(self.config, 'add_diff_ids', False):
+                     diff_id = self._active_diff_id() or self._new_diff_id()
+                     li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+
+                self.append(START, (li_tag, li_attrs), pos)
+                # Ensure we close this LI after the block ends
+                self._wrap_change_end_for.append((lname, li_tag, None))
+
             self.append(START, (change_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
             self.enter(pos, tag, attrs)
             # Store context to restore effectively (we clear it so nested text isn't double wrapped)
@@ -633,14 +651,23 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             self._skip_end_for.pop()
             return True
 
-        # Close wrapper <ins>/<del> for wrapped void or block elements after their END.
-        if self._wrap_change_end_for and self._wrap_change_end_for[-1][0] == lname:
+        # Close wrapper <ins>/<del> (and potentially synthetic parents like <li>) 
+        # for wrapped void or block elements after their END.
+        # We use a loop because we might have multiple wrappers (e.g. <li><del>... for an invalid child).
+        handled_leave = False
+        while self._wrap_change_end_for and self._wrap_change_end_for[-1][0] == lname:
             _lname, change_tag, restore_ctx = self._wrap_change_end_for.pop()
-            self.leave(pos, data)
+            
+            if not handled_leave:
+                self.leave(pos, data)
+                handled_leave = True
+                
             if change_tag:
                 self.append(END, change_tag, pos)
             if restore_ctx is not None:
                 self._context = restore_ctx
+        
+        if handled_leave:
             return True
 
         self.leave(pos, data)
