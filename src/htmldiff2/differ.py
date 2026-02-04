@@ -637,7 +637,8 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         if self._wrap_change_end_for and self._wrap_change_end_for[-1][0] == lname:
             _lname, change_tag, restore_ctx = self._wrap_change_end_for.pop()
             self.leave(pos, data)
-            self.append(END, change_tag, pos)
+            if change_tag:
+                self.append(END, change_tag, pos)
             if restore_ctx is not None:
                 self._context = restore_ctx
             return True
@@ -1344,6 +1345,28 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                             continue
 
             if tag == 'replace':
+                # Special Check: Attribute-only change on a structural start tag?
+                # Pattern: replace(START) where tag names match and is structural.
+                # This avoids nesting (e.g. <ul deleted><ul added>...</ul></ul>).
+                if (i2 - i1) == 1 and (j2 - j1) == 1:
+                    old_atom = self._old_atoms[i1]
+                    new_atom = self._new_atoms[j1]
+                    old_evs = old_atom.get('events', [])
+                    new_evs = new_atom.get('events', [])
+                    
+                    if len(old_evs) == 1 and len(new_evs) == 1:
+                        old_ev = old_evs[0]
+                        new_ev = new_evs[0]
+                        if old_ev[0] == START and new_ev[0] == START:
+                            (old_t, old_attrs) = old_ev[1]
+                            (new_t, new_attrs) = new_ev[1]
+                            structural_tags = ('table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'ul', 'ol', 'li')
+                            lname = qname_localname(old_t)
+                            if lname == qname_localname(new_t) and lname in structural_tags:
+                                self.enter_mark_replaced(new_ev[2], new_t, new_attrs, old_attrs)
+                                k += 1
+                                continue
+
                 self._process_replace_opcode(self._old_atoms[i1:i2], self._new_atoms[j1:j2])
             elif tag == 'delete':
                 with self.diff_group():

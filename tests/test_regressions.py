@@ -645,6 +645,44 @@ def test_bullets_paragraph_to_list_conversion_is_grouped_and_structural():
     assert "<ins" in out
 
 
+def test_ul_style_change_is_replaced_not_nested():
+    """
+    Test that changing style/attributes on a structural tag (like UL)
+    results in a single tag with 'tagdiff_replaced' class,
+    NOT a deleted UL containing an added UL (nested structure).
+    """
+    old = """
+<p>Hallazgos.</p>
+<ul style="margin-top: 0; margin-bottom: 0;">
+<li>Item 1</li>
+<li>Item 2</li>
+</ul>
+<p>Conclusion</p>
+"""
+    new = """
+<p>Hallazgos.</p>
+<ul style="margin-top: 0; margin-bottom: 0; font-size: 12pt;">
+<li>Item 1</li>
+<li>Item 2</li>
+</ul>
+<p>Conclusion</p>
+"""
+    out = htmldiff2.render_html_diff(old.strip(), new.strip())
+
+    # Should use tagdiff_replaced
+    assert 'class="tagdiff_replaced"' in out
+    
+    # Should NOT satisfy the nested deleted/added pattern
+    # Checks for <ul ... class="tagdiff_deleted"><ul ... class="tagdiff_added"> which was the bug
+    assert not ('tagdiff_deleted' in out and 'tagdiff_added' in out)
+    
+    # Verify the UL has the class
+    assert '<ul' in out
+    # Simple check that we don't have multiple UL openings if we expect one
+    # (Though in a real diff we might have others, here inputs are small)
+    assert out.count('<ul') == 1
+
+
 def test_table_remove_description_column_marks_deleted_cells():
     # From scripts/repro_table_remove_description_column_exact.py
     old = """<table>
