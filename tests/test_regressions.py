@@ -705,12 +705,17 @@ def test_paragraphs_converted_to_list_wrapped_correctly():
     # Or similar, but NOT <ul ...> <del> ... </del> </ul>
     
     # Check that <del> is NOT a direct child of <ul> (approximate check)
-    # Correct: <li ...><del>...
-    assert '<li class="tagdiff_deleted"><del>' in out or '<li class="tagdiff_added"><del>' in out
+    # The output might contain data-diff-id, so we use regex or robust checks.
+    # We look for LI with tagdiff_deleted/added containing a DEL/INS
+    import re
+    
+    # Matches <li ... class="...tagdiff_deleted..." ...><del
+    # We need to account for arbitrary attributes and spacing
+    li_del_pattern = r'<li[^>]*class=["\'][^"\']*tagdiff_(deleted|added)[^"\']*["\'][^>]*>\s*<(del|ins)'
+    assert re.search(li_del_pattern, out), f"Did not find wrapped list item in output: {out}"
     
     # Verify we don't have the invalid structure
     # This regex looks for <ul ...> then immediate <del
-    import re
     assert not re.search(r'<ul[^>]*>\s*<del', out), "Found <del> directly inside <ul>"
     
     # Verify content is preserved
