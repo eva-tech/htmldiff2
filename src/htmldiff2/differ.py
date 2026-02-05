@@ -4,13 +4,11 @@ Clases principales para realizar diffs de streams de Genshi.
 """
 from __future__ import with_statement
 
-import re
 from difflib import SequenceMatcher
-from itertools import chain
 from contextlib import contextmanager
 from genshi.core import Stream, QName, Attrs, START, END, TEXT
 
-from .config import DiffConfig, text_type, _leading_space_re, _diff_split_re, _token_split_re, INLINE_FORMATTING_TAGS, BLOCK_WRAPPER_TAGS
+from .config import DiffConfig, text_type, INLINE_FORMATTING_TAGS, BLOCK_WRAPPER_TAGS
 from .utils import (
     qname_localname, collapse_ws, strip_edge_whitespace_events,
     extract_text_from_events, raw_text_from_events, concat_events,
@@ -26,30 +24,19 @@ from .normalization import (
     should_force_visual_replace
 )
 from .parser import longzip
-
-
-class InsensitiveSequenceMatcher(SequenceMatcher):
-    """
-    SequenceMatcher that ignores very small matching blocks.
-    
-    This prevents "shredded" diffs where unrelated texts get word-by-word
-    interleaving due to incidental small matches (e.g., "del" matching "DE").
-    """
-    
-    def __init__(self, isjunk=None, a='', b='', threshold=2):
-        super().__init__(isjunk, a, b)
-        self.threshold = threshold
-    
-    def get_matching_blocks(self):
-        # Dynamically adjust threshold based on sequence size to avoid
-        # over-filtering on very short sequences.
-        size = min(len(self.a), len(self.b))
-        effective_threshold = min(self.threshold, size // 4)
-        
-        blocks = super().get_matching_blocks()
-        # Keep blocks larger than threshold, or the sentinel (size=0) at the end.
-        return [block for block in blocks 
-                if block[2] > effective_threshold or block[2] == 0]
+from .table_differ import (
+    extract_direct_tr_cells, extract_tr_blocks, row_key, cell_key,
+    diff_table_by_rows, diff_tr_by_cells
+)
+from .block_processor import block_process as block_process_events
+from .visual_replace import (
+    try_visual_wrapper_toggle_without_dup, can_unwrap_wrapper,
+    can_visual_container_replace, wrap_inline_visual_replace,
+    wrap_block_visual_replace, render_visual_replace_inline,
+    find_inline_wrapper_bounds, validate_prefix_suffix_alignment,
+    try_inline_wrapper_to_plain
+)
+from .text_differ import mark_text, diff_text
 
 
 def diff_genshi_stream(old_stream, new_stream):
@@ -170,141 +157,12 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
     def append(self, type, data, pos):
         self._result.append((type, data, pos))
 
-    def text_split(self, text):
-        """
-        Tokenize text for diffing.
-
-        We prefer a tokenizer that separates punctuation (e.g. "CAD" vs "CAD.")
-        so pure punctuation edits become insert/delete instead of replace that
-        accidentally includes adjacent whitespace.
-        """
-        if getattr(self.config, 'tokenize_text', True):
-            rx = getattr(self.config, 'tokenize_regex', _token_split_re)
-            parts = [p for p in rx.split(text) if p != u'']
-            return parts
-        # Legacy behavior: keep words glued to following whitespace
-        worditer = chain([u''], _diff_split_re.split(text))
-        return [x + next(worditer) for x in worditer]
-
-    def cut_leading_space(self, s):
-        match = _leading_space_re.match(s)
-        if match is None:
-            return u'', s
-        return match.group(), s[match.end():]
-
-    def mark_text(self, pos, text, tag, diff_id=None):
-        def _make_ws_visible(s):
-            # Convert whitespace that would otherwise be collapsed by HTML into NBSPs,
-            # but keep single mid-string spaces intact for readability.
-            if not s:
-                return s
-            # Leading / trailing spaces: always NBSP
-            s = re.sub(r'^\s+', lambda m: u'\u00a0' * len(m.group(0)), s, flags=re.U)
-            s = re.sub(r'\s+$', lambda m: u'\u00a0' * len(m.group(0)), s, flags=re.U)
-            # Runs of 2+ spaces inside: NBSP for the run
-            s = re.sub(r' {2,}', lambda m: u'\u00a0' * len(m.group(0)), s)
-            return s
-
-        tag = QName(tag)
-        preserve_ws = getattr(self.config, 'preserve_whitespace_in_diff', True) and qname_localname(tag) in ('del', 'ins')
-        if preserve_ws:
-            text = _make_ws_visible(text)
-            attrs = self._change_attrs(diff_id=diff_id)
-            self.append(START, (tag, attrs), pos)
-            self.append(TEXT, text, pos)
-            self.append(END, tag, pos)
-            return
-
-        ws, text = self.cut_leading_space(text)
-        if ws:
-            self.append(TEXT, ws, pos)
-        attrs = self._change_attrs(diff_id=diff_id)
-        self.append(START, (tag, attrs), pos)
-        self.append(TEXT, text, pos)
-        self.append(END, tag, pos)
-
-    def diff_text(self, pos, old_text, new_text):
-        old = self.text_split(old_text)
-        new = self.text_split(new_text)
-        threshold = getattr(self.config, 'sequence_match_threshold', 2)
-        matcher = InsensitiveSequenceMatcher(None, old, new, threshold=threshold)
-
-        def wrap(tag, words, diff_id=None):
-            return self.mark_text(pos, u''.join(words), tag, diff_id=diff_id)
-
-        # Enforce deterministic delete->insert ordering within each changed region.
-        # SequenceMatcher can produce patterns like delete/insert/delete (e.g. when
-        # a middle token changes), which renders as insertion "inside" deletion.
-        pending_del = []
-        pending_ins = []
-
-        def flush_pending():
-            if pending_del and pending_ins:
-                # Pair del+ins under the same diff-id for per-change frontend actions.
-                diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
-                wrap('del', pending_del, diff_id=diff_id)
-                del pending_del[:]
-                wrap('ins', pending_ins, diff_id=diff_id)
-                del pending_ins[:]
-                return
-            if pending_del:
-                wrap('del', pending_del, diff_id=(self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None))
-                del pending_del[:]
-            if pending_ins:
-                wrap('ins', pending_ins, diff_id=(self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None))
-                del pending_ins[:]
-
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag == 'equal':
-                flush_pending()
-                self.append(TEXT, u''.join(old[i1:i2]), pos)
-                continue
-            if tag == 'replace':
-                # Special-case: whitespace-only "replace" where the only change is the
-                # multiplicity of spaces (e.g. "   " -> " "). SequenceMatcher tends
-                # to emit this as replace, which renders as del+ins. For EdenAI we
-                # prefer a minimal representation: keep the common whitespace
-                # unchanged, and only mark the extra spaces as deleted/inserted.
-                old_part = u''.join(old[i1:i2])
-                new_part = u''.join(new[j1:j2])
-                if (
-                    old_part
-                    and new_part
-                    and old_part.strip() == u''
-                    and new_part.strip() == u''
-                    and ('\n' not in old_part and '\r' not in old_part)
-                    and ('\n' not in new_part and '\r' not in new_part)
-                ):
-                    flush_pending()
-                    common_len = 0
-                    max_common = min(len(old_part), len(new_part))
-                    while common_len < max_common and old_part[common_len] == new_part[common_len]:
-                        common_len += 1
-                    if common_len:
-                        self.append(TEXT, new_part[:common_len], pos)
-                    old_rem = old_part[common_len:]
-                    new_rem = new_part[common_len:]
-                    if old_rem:
-                        pending_del.append(old_rem)
-                    if new_rem:
-                        pending_ins.append(new_rem)
-                    continue
-                pending_del.extend(old[i1:i2])
-                pending_ins.extend(new[j1:j2])
-            elif tag == 'delete':
-                pending_del.extend(old[i1:i2])
-            elif tag == 'insert':
-                pending_ins.extend(new[j1:j2])
-            else:
-                pass
-        flush_pending()
-
     def _handle_replace_special_cases(self, old, new, old_start, old_end, new_start, new_end):
         """Maneja casos especiales de reemplazo antes del procesamiento general."""
         # Special-case: one inline wrapper removed/changed while keeping a shared
         # prefix/suffix. This prevents over-highlighting unchanged prefix text
         # (e.g. "Texto " in underline_removal) and keeps del->ins ordering.
-        if self._try_inline_wrapper_to_plain(old, new):
+        if try_inline_wrapper_to_plain(self, old, new):
             return True
 
         # Special-case: visual-only wrapper added/removed around identical text,
@@ -312,7 +170,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         # happens a lot (<td>10.8</td> -> <td><strong style=...>10.8</strong></td>).
         # Rendering this as del+ins duplicates the same value and looks terrible.
         # Instead, render a single copy and mark the wrapper as "replaced".
-        if self._try_visual_wrapper_toggle_without_dup(old, new):
+        if try_visual_wrapper_toggle_without_dup(self, old, new):
             return True
 
         # Fallback: If the new side collapses to a single TEXT node but the old side contains
@@ -326,7 +184,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
         # Special-case: unwrap/wrap inline wrapper (e.g. <b>/<strong>) with same text.
         # Fixes Bold -> Normal and maintains consistent Delete -> Insert.
-        if self._can_unwrap_wrapper(old, new):
+        if can_unwrap_wrapper(self, old, new):
             with self.diff_group():
                 self.delete(old_start, old_end)
                 self.insert(new_start, new_end)
@@ -335,12 +193,12 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         # Special-case: visual-only changes (same text, different attrs/tag).
         # Required to mark font-size/font-weight/class/style/id changes as diffs even
         # when text is identical.
-        if self._can_visual_container_replace(old, new):
+        if can_visual_container_replace(self, old, new):
             if getattr(self.config, 'visual_replace_inline', True):
                 # Render inline del->ins while keeping styles, so changes like
                 # font-size/font-weight don't turn into separate block lines.
                 with self.diff_group():
-                    self._render_visual_replace_inline(old, new)
+                    render_visual_replace_inline(self, old, new)
             else:
                 with self.diff_group():
                     self.delete(old_start, old_end)
@@ -362,7 +220,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 self.leave(pos, old_event[1])
         elif event_type == TEXT:
             _, new_text, pos = new_event
-            self.diff_text(pos, old_event[1], new_text)
+            diff_text(self, pos, old_event[1], new_text)
         else:
             self.append(*new_event)
 
@@ -372,7 +230,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         # If the old event was text and the new one is the start or end of a tag
         if old_event[0] == TEXT and new_event[0] in (START, END):
             _, text, pos = old_event
-            self.mark_text(pos, text, 'del')
+            mark_text(self, pos, text, 'del')
             type, data, pos = new_event
             if type == START:
                 self.enter(pos, *data)
@@ -423,86 +281,6 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                                        new_start, new_end, idx):
                     break
 
-    def _try_visual_wrapper_toggle_without_dup(self, old_events, new_events):
-        """
-        If one side is plain text and the other wraps the *same* text in a single
-        inline wrapper with visual attrs (style/class/id), render only one copy
-        and mark it as tagdiff_replaced.
-
-        This reduces noisy table diffs where many cells get styled (highlighting),
-        and avoids duplicating values inside <td>/<th>.
-        """
-
-        def parse(events):
-            lws, core, tws = strip_edge_whitespace_events(events)
-            if len(core) == 1 and core[0][0] == TEXT:
-                return ('plain', lws, core[0], tws, None, None)
-            if len(core) >= 3 and core[0][0] == START and core[-1][0] == END:
-                tag, attrs = core[0][1]
-                lname = qname_localname(tag)
-                if lname in INLINE_FORMATTING_TAGS and qname_localname(core[-1][1]) == lname:
-                    inner = core[1:-1]
-                    if inner and all(t == TEXT for (t, _d, _p) in inner):
-                        return ('wrap', lws, inner, tws, (tag, attrs), lname)
-            return None
-
-        o = parse(old_events)
-        n = parse(new_events)
-        if not o or not n:
-            return False
-
-        # Addition: plain -> styled wrapper
-        if o[0] == 'plain' and n[0] == 'wrap':
-            _o_kind, _o_lws, o_text_ev, _o_tws, _o_tagattrs, _o_lname = o
-            _n_kind, n_lws, n_inner, n_tws, (n_tag, n_attrs), _n_lname = n
-            if not has_visual_attrs(n_attrs, self.config):
-                return False
-            if collapse_ws(o_text_ev[1]) != collapse_ws(extract_text_from_events(n_inner)):
-                return False
-            for ev in n_lws:
-                self.append(*ev)
-            # Genshi Attrs is list-like, not dict-like
-            attrs2 = Attrs(list(n_attrs))
-            attrs2 = self.inject_class(attrs2, 'tagdiff_replaced')
-            attrs2 |= [(QName('data-old-tag'), 'none')]
-            if getattr(self.config, 'add_diff_ids', False):
-                diff_id = self._active_diff_id() or self._new_diff_id()
-                attrs2 = self._set_attr(attrs2, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-            pos = (n_inner[0][2] if n_inner else (new_events[0][2] if new_events else old_events[0][2]))
-            self.append(START, (n_tag, attrs2), pos)
-            for ev in n_inner:
-                self.append(*ev)
-            self.append(END, n_tag, pos)
-            for ev in n_tws:
-                self.append(*ev)
-            return True
-
-        # Removal: styled wrapper -> plain
-        if o[0] == 'wrap' and n[0] == 'plain':
-            _o_kind, _o_lws, o_inner, _o_tws, (_o_tag, o_attrs), o_lname = o
-            _n_kind, n_lws, n_text_ev, n_tws, _n_tagattrs, _n_lname = n
-            if not has_visual_attrs(o_attrs, self.config):
-                return False
-            if collapse_ws(extract_text_from_events(o_inner)) != collapse_ws(n_text_ev[1]):
-                return False
-            for ev in n_lws:
-                self.append(*ev)
-            span_tag = QName('span')
-            span_attrs = Attrs()
-            span_attrs |= [(QName('data-old-tag'), o_lname)]
-            span_attrs = self.inject_refattr(span_attrs, o_attrs)
-            span_attrs = self.inject_class(span_attrs, 'tagdiff_replaced')
-            if getattr(self.config, 'add_diff_ids', False):
-                diff_id = self._active_diff_id() or self._new_diff_id()
-                span_attrs = self._set_attr(span_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-            self.append(START, (span_tag, span_attrs), n_text_ev[2])
-            self.append(*n_text_ev)
-            self.append(END, span_tag, n_text_ev[2])
-            for ev in n_tws:
-                self.append(*ev)
-            return True
-
-        return False
 
     def delete(self, start, end):
         with self.context('del'):
@@ -546,510 +324,12 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         del self._stack[:]
 
     def block_process(self, events):
-        for event in events:
-            event_type, data, pos = event
-            if event_type == START:
-                tag, attrs = data
-                if self._handle_start_event_in_block(tag, attrs, pos):
-                    continue
-            elif event_type == END:
-                if self._handle_end_event_in_block(data, pos):
-                    continue
-            elif event_type == TEXT:
-                self._handle_text_event_in_block(data, pos)
-            else:
-                self.append(event_type, data, pos)
+        """Process block-level events."""
+        block_process_events(self, events)
 
-    def _handle_start_event_in_block(self, tag, attrs, pos):
-        """Maneja eventos START dentro de block_process."""
-        lname = qname_localname(tag)
-        # Visualize <br> changes explicitly
-        if lname == 'br' and self._context in ('ins', 'del'):
-            marker = getattr(self.config, 'linebreak_marker', u'\u00b6')
-            if self._context == 'ins':
-                # <ins>¶</ins><br>
-                self.mark_text(pos, marker, 'ins')
-                self.enter(pos, tag, attrs)
-            else:
-                # <del>¶<br></del> (put <br> inside <del> so it gets deleted properly)
-                # Create <del> tag manually so we can put <br> inside before closing
-                change_tag = QName('del')
-                change_attrs = self._change_attrs(diff_id=self._active_diff_id())
-                self.append(START, (change_tag, change_attrs), pos)
-                # Put the marker text inside
-                self.append(TEXT, marker, pos)
-                # Put the <br> INSIDE the <del> tag
-                self.append(START, (tag, attrs), pos)
-                self.append(END, tag, pos)
-                # Now close the <del>
-                self.append(END, change_tag, pos)
-                self._skip_end_for.append(lname)
-            return True
 
-        # For structural tags that shouldn't be wrapped in <ins>/<del> (to keep HTML valid
-        # and avoid "ghost" cells/bullets), we inject a special class into the tag itself.
-        structural_tags = ('table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'ul', 'ol', 'li')
-        if lname in structural_tags and self._context in ('ins', 'del'):
-            suffix = 'added' if self._context == 'ins' else 'deleted'
-            attrs = self.inject_class(attrs, 'tagdiff_' + suffix)
-            if getattr(self.config, 'add_diff_ids', False):
-                diff_id = self._active_diff_id() or self._new_diff_id()
-                attrs = self._set_attr(attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-            
-            # Use enter() which preserves the tag but with our new class.
-            # We don't return True here because we WANT the children to be processed
-            # normally (wrapped in <ins>/<del> for text) to maintain visual consistency.
-            self.enter(pos, tag, attrs)
-            return True
-            
-        # Wrap block wrappers (p, h1, etc.) so the whole element is deleted/inserted.
-        # This prevents "empty tags" remaining after accept/reject (e.g. <p><del>...</del></p> -> <p></p>).
-        if lname in BLOCK_WRAPPER_TAGS and self._context in ('ins', 'del'):
-            change_tag = QName(self._context)
-            
-            # Special Check: Are we inserting/deleting a block element directly inside a List?
-            # e.g. <ul><del><p>...</p></del></ul> is invalid. It should be <ul><li><del><p>...</p></del></li></ul>.
-            # Convert context-less blocks into proper list items if needed.
-            if self._stack and qname_localname(self._stack[-1]) in ('ul', 'ol') and lname != 'li':
-                # Inject Synthetic LI wrapper
-                li_tag = QName('li')
-                li_attrs = Attrs([
-                    (QName('class'), 'tagdiff_added' if self._context == 'ins' else 'tagdiff_deleted')
-                ])
-                if getattr(self.config, 'add_diff_ids', False):
-                     diff_id = self._active_diff_id() or self._new_diff_id()
-                     li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
 
-                self.append(START, (li_tag, li_attrs), pos)
-                # Ensure we close this LI after the block ends
-                self._wrap_change_end_for.append((lname, li_tag, None))
 
-            self.append(START, (change_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
-            self.enter(pos, tag, attrs)
-            # Store context to restore effectively (we clear it so nested text isn't double wrapped)
-            self._wrap_change_end_for.append((lname, change_tag, self._context))
-            self._context = None 
-            return True
-
-        # Wrap void/non-textual elements (e.g. <img>) with <ins>/<del> so the
-        # change is visible even though there is no TEXT to mark.
-        wrap_void = set(getattr(self.config, 'wrap_void_tag_changes_with_ins_del', ()))
-        if lname in wrap_void and self._context in ('ins', 'del'):
-            change_tag = QName(self._context)
-            self.append(START, (change_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
-            self.enter(pos, tag, attrs)
-            self._wrap_change_end_for.append((lname, change_tag, None))
-            return True
-
-        self.enter(pos, tag, attrs)
-        return False
-
-    def _handle_end_event_in_block(self, data, pos):
-        """Maneja eventos END dentro de block_process."""
-        lname = qname_localname(data)
-        if self._skip_end_for and self._skip_end_for[-1] == lname:
-            self._skip_end_for.pop()
-            return True
-
-        # Close wrapper <ins>/<del> (and potentially synthetic parents like <li>) 
-        # for wrapped void or block elements after their END.
-        # We use a loop because we might have multiple wrappers (e.g. <li><del>... for an invalid child).
-        handled_leave = False
-        while self._wrap_change_end_for and self._wrap_change_end_for[-1][0] == lname:
-            _lname, change_tag, restore_ctx = self._wrap_change_end_for.pop()
-            
-            if not handled_leave:
-                self.leave(pos, data)
-                handled_leave = True
-                
-            if change_tag:
-                self.append(END, change_tag, pos)
-            if restore_ctx is not None:
-                self._context = restore_ctx
-        
-        if handled_leave:
-            return True
-
-        self.leave(pos, data)
-        return False
-
-    def _handle_text_event_in_block(self, data, pos):
-        """Maneja eventos TEXT dentro de block_process."""
-        if self._context is not None:
-            # Wrap visible text AND inline whitespace (e.g. the space between words)
-            # so inserts like "en negrita" highlight the whole phrase including space.
-            # Avoid wrapping newline indentation, which would create noisy diffs.
-            if data.strip() or ('\n' not in data and '\r' not in data):
-                self.mark_text(pos, data, self._context)
-                return
-        self.append(TEXT, data, pos)
-
-    def _extract_direct_tr_cells(self, tr_events):
-        """
-        Extract direct child <td>/<th> blocks from a <tr> event slice.
-
-        Returns a list of dicts: { 'tag': 'td'|'th', 'events': [...], 'attrs': Attrs }.
-        """
-        cells = []
-        i = 0
-        n = len(tr_events)
-        while i < n:
-            etype, data, _pos = tr_events[i]
-            if etype == START:
-                tag, attrs = data
-                lname = qname_localname(tag)
-                if lname in ('td', 'th'):
-                    # Find matching END for this cell
-                    depth = 1
-                    j = i + 1
-                    while j < n and depth:
-                        t2, d2, _p2 = tr_events[j]
-                        if t2 == START and qname_localname(d2[0]) == lname:
-                            depth += 1
-                        elif t2 == END and qname_localname(d2) == lname:
-                            depth -= 1
-                        j += 1
-                    block = tr_events[i:j]
-                    cells.append({'tag': lname, 'events': block, 'attrs': attrs})
-                    i = j
-                    continue
-            i += 1
-        return cells
-
-    def _extract_tr_blocks(self, table_events):
-        """Extract all <tr> blocks found within a <table> event slice (thead/tbody included)."""
-        blocks = []
-        i = 0
-        n = len(table_events)
-        while i < n:
-            etype, data, _pos = table_events[i]
-            if etype == START:
-                tag, _attrs = data
-                lname = qname_localname(tag)
-                if lname == "tr":
-                    depth = 1
-                    j = i + 1
-                    while j < n and depth:
-                        t2, d2, _p2 = table_events[j]
-                        if t2 == START and qname_localname(d2[0]) == "tr":
-                            depth += 1
-                        elif t2 == END and qname_localname(d2) == "tr":
-                            depth -= 1
-                        j += 1
-                    blocks.append(table_events[i:j])
-                    i = j
-                    continue
-            i += 1
-        return blocks
-
-    def _row_key(self, tr_events):
-        """Key to align rows across table changes (based on first 2 cells' text)."""
-        cells = self._extract_direct_tr_cells(tr_events)
-        if not cells:
-            return ("", "")
-        def _cell_txt(c):
-            return collapse_ws(extract_text_from_events(c["events"]))
-        c0 = _cell_txt(cells[0]) if len(cells) > 0 else ""
-        c1 = _cell_txt(cells[1]) if len(cells) > 1 else ""
-        return (c0, c1)
-
-    def _diff_table_by_rows(self, old_table_events, new_table_events):
-        """
-        Diff a table by aligning rows (<tr>) and diffing each row by cells.
-
-        This keeps the output HTML valid even when the LLM restyles the table/tag
-        attributes, and ensures column removals are handled by our row-aware
-        `_diff_tr_by_cells` logic.
-        """
-        if not old_table_events or not new_table_events:
-            inner = _EventDiffer(old_table_events, new_table_events, self.config, diff_id_state=self._diff_id_state)
-            for ev in inner.get_diff_events():
-                self.append(*ev)
-            return
-
-        # Emit the table wrapper from the OLD side (keeps structure valid; inner diffs
-        # will mark style/attr changes at cell level).
-        self.append(*old_table_events[0])
-
-        old_rows = self._extract_tr_blocks(old_table_events)
-        new_rows = self._extract_tr_blocks(new_table_events)
-        old_keys = [self._row_key(r) for r in old_rows]
-        new_keys = [self._row_key(r) for r in new_rows]
-
-        matcher = SequenceMatcher(None, old_keys, new_keys)
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag == "equal":
-                for oi, nj in zip(range(i1, i2), range(j1, j2)):
-                    self._diff_tr_by_cells(old_rows[oi], new_rows[nj])
-            elif tag == "delete":
-                with self.diff_group():
-                    with self.context("del"):
-                        for oi in range(i1, i2):
-                            self.block_process(old_rows[oi])
-            elif tag == "insert":
-                with self.diff_group():
-                    with self.context("ins"):
-                        for nj in range(j1, j2):
-                            self.block_process(new_rows[nj])
-            else:  # replace
-                # Pair rows positionally where possible
-                n = min(i2 - i1, j2 - j1)
-                for k in range(n):
-                    self._diff_tr_by_cells(old_rows[i1 + k], new_rows[j1 + k])
-                if (i2 - i1) > n:
-                    with self.diff_group():
-                        with self.context("del"):
-                            for oi in range(i1 + n, i2):
-                                self.block_process(old_rows[oi])
-                if (j2 - j1) > n:
-                    with self.diff_group():
-                        with self.context("ins"):
-                            for nj in range(j1 + n, j2):
-                                self.block_process(new_rows[nj])
-
-        # Emit closing </table> from OLD wrapper.
-        self.append(*old_table_events[-1])
-
-    def _cell_key(self, cell):
-        """Key used to align table cells inside a row."""
-        lname = cell['tag']
-        block_events = cell['events']
-        attrs = cell.get('attrs')
-        block_text = collapse_ws(extract_text_from_events(block_events))
-        # Match mostly by visible text + structure; attrs included to allow visual-only diffs.
-        return (lname, block_text, attrs_signature(attrs, self.config), structure_signature(block_events, self.config))
-
-    def _diff_tr_by_cells(self, old_tr_events, new_tr_events):
-        """
-        Diff a table row by aligning direct child cells (<td>/<th>) with a row-aware
-        algorithm that prefers preserving left-to-right structure.
-
-        This avoids SequenceMatcher's tendency to misalign duplicate values (e.g. "8", "8")
-        when a column is removed/inserted, which otherwise causes the wrong cell/column
-        to be marked as deleted and can break the table when changes are applied.
-        """
-        # Defensive: if the slice doesn't look like a <tr> block, fall back.
-        if not old_tr_events or not new_tr_events:
-            inner = _EventDiffer(old_tr_events, new_tr_events, self.config, diff_id_state=self._diff_id_state)
-            for ev in inner.get_diff_events():
-                self.append(*ev)
-            return
-
-        # Emit the <tr> wrapper (keep old wrapper; attributes rarely matter here).
-        self.append(*old_tr_events[0])
-
-        old_cells = self._extract_direct_tr_cells(old_tr_events)
-        new_cells = self._extract_direct_tr_cells(new_tr_events)
-        # Two key types:
-        # - align key (text-only): used to keep column alignment stable even if the LLM
-        #   adds styling/attributes (border/padding) everywhere.
-        # - full key (includes attrs/structure): used only when deciding whether we
-        #   need to render a replace vs. let EventDiffer mark attribute diffs.
-        def _align_key(cell):
-            return (
-                cell["tag"],
-                collapse_ws(extract_text_from_events(cell["events"])),
-            )
-
-        old_align = [_align_key(c) for c in old_cells]
-        new_align = [_align_key(c) for c in new_cells]
-
-        def _diff_cell_pair(old_cell, new_cell):
-            """Diff one old/new cell (td/th), preserving structure.
-            
-            When text differs, emit a SINGLE cell wrapper with inline del/ins
-            for the content, instead of two separate cells (which creates an extra column).
-            """
-            # If the visible text is the same, prefer an inner diff so style/attrs
-            # changes do NOT shift column alignment.
-            if _align_key(old_cell) == _align_key(new_cell):
-                inner = _EventDiffer(old_cell['events'], new_cell['events'], self.config, diff_id_state=self._diff_id_state)
-                for ev in inner.get_diff_events():
-                    self.append(*ev)
-                return
-            
-            # Text differs: emit SINGLE cell with inline del/ins content.
-            # Use old cell's wrapper (preserves original structure/attrs).
-            old_events = old_cell['events']
-            new_events = new_cell['events']
-            
-            # Find the cell wrapper START and END
-            # old_events[0] = (START, (tag, attrs), pos)
-            # old_events[-1] = (END, tag, pos)
-            if not old_events or old_events[0][0] != START or old_events[-1][0] != END:
-                # Fallback: emit both cells (shouldn't happen)
-                with self.diff_group():
-                    with self.context('del'):
-                        self.block_process(old_events)
-                    with self.context('ins'):
-                        self.block_process(new_events)
-                return
-            
-            cell_start = old_events[0]
-            cell_end = old_events[-1]
-            old_content = old_events[1:-1]  # Content between <td> and </td>
-            new_content = new_events[1:-1] if len(new_events) > 2 else []
-            
-            # Emit single cell wrapper
-            self.append(*cell_start)
-            
-            with self.diff_group():
-                # Deleted content
-                if old_content:
-                    with self.context('del'):
-                        self.block_process(old_content)
-                # Inserted content
-                if new_content:
-                    with self.context('ins'):
-                        self.block_process(new_content)
-            
-            # Close cell
-            self.append(*cell_end)
-
-        def _best_single_delete_index(oldk, newk):
-            """
-            Choose which index to delete from old (len(old)=len(new)+1) to best
-            preserve left-to-right alignment. Important when many cells are empty
-            (empty keys are identical and would otherwise drift).
-            """
-            best_k = 0
-            best_score = -1
-            new_len = len(newk)
-            for k in range(len(oldk)):
-                score = 0
-                # prefix
-                for i0 in range(min(k, new_len)):
-                    if oldk[i0] == newk[i0]:
-                        score += 1
-                # suffix: old[k+1:] aligns with new[k:]
-                for i0 in range(k, new_len):
-                    if oldk[i0 + 1] == newk[i0]:
-                        score += 1
-                if score > best_score:
-                    best_score = score
-                    best_k = k
-            return best_k
-
-        def _best_single_insert_index(oldk, newk):
-            """
-            Choose which index to insert into old (len(new)=len(old)+1) by selecting
-            the index in new that best preserves alignment (i.e. delete that index
-            from new yields best match).
-            """
-            best_k = 0
-            best_score = -1
-            old_len = len(oldk)
-            for k in range(len(newk)):
-                score = 0
-                # prefix
-                for i0 in range(min(k, old_len)):
-                    if oldk[i0] == newk[i0]:
-                        score += 1
-                # suffix: old[k:] aligns with new[k+1:]
-                for i0 in range(k, old_len):
-                    if oldk[i0] == newk[i0 + 1]:
-                        score += 1
-                if score > best_score:
-                    best_score = score
-                    best_k = k
-            return best_k
-
-        # Special-case: single-column removal/addition. Do a positional alignment
-        # with a stable chosen index, instead of key-based matching that can drift
-        # across identical empty cells.
-        if len(old_cells) == len(new_cells) + 1:
-            k = _best_single_delete_index(old_align, new_align)
-            # diff cells before k
-            for idx in range(k):
-                if idx < len(new_cells):
-                    _diff_cell_pair(old_cells[idx], new_cells[idx])
-                else:
-                    with self.diff_group():
-                        with self.context('del'):
-                            self.block_process(old_cells[idx]['events'])
-            # delete the removed column cell
-            with self.diff_group():
-                with self.context('del'):
-                    self.block_process(old_cells[k]['events'])
-            # diff remaining cells after k (shifted left by one)
-            for idx in range(k, len(new_cells)):
-                _diff_cell_pair(old_cells[idx + 1], new_cells[idx])
-            self.append(*old_tr_events[-1])
-            return
-
-        if len(new_cells) == len(old_cells) + 1:
-            k = _best_single_insert_index(old_align, new_align)
-            # diff cells before k
-            for idx in range(k):
-                if idx < len(old_cells):
-                    _diff_cell_pair(old_cells[idx], new_cells[idx])
-                else:
-                    with self.diff_group():
-                        with self.context('ins'):
-                            self.block_process(new_cells[idx]['events'])
-            # insert the added column cell
-            with self.diff_group():
-                with self.context('ins'):
-                    self.block_process(new_cells[k]['events'])
-            # diff remaining cells after k (shifted right by one in new)
-            for idx in range(k, len(old_cells)):
-                _diff_cell_pair(old_cells[idx], new_cells[idx + 1])
-            self.append(*old_tr_events[-1])
-            return
-
-        i = 0
-        j = 0
-        while i < len(old_cells) or j < len(new_cells):
-            if i < len(old_cells) and j < len(new_cells) and old_align[i] == new_align[j]:
-                # Same cell -> inner diff to catch formatting/text changes.
-                inner = _EventDiffer(old_cells[i]['events'], new_cells[j]['events'], self.config, diff_id_state=self._diff_id_state)
-                for ev in inner.get_diff_events():
-                    self.append(*ev)
-                i += 1
-                j += 1
-                continue
-
-            old_remaining = len(old_cells) - i
-            new_remaining = len(new_cells) - j
-
-            if i < len(old_cells) and old_remaining > new_remaining:
-                # Prefer deleting from old when old has extra cells (common: column removal).
-                with self.diff_group():
-                    with self.context('del'):
-                        self.block_process(old_cells[i]['events'])
-                i += 1
-                continue
-
-            if j < len(new_cells) and new_remaining > old_remaining:
-                # Prefer inserting when new has extra cells (column insertion).
-                with self.diff_group():
-                    with self.context('ins'):
-                        self.block_process(new_cells[j]['events'])
-                j += 1
-                continue
-
-            # Same remaining length but different keys => treat as replace (paired).
-            # Use _diff_cell_pair to emit SINGLE cell with inline del/ins.
-            if i < len(old_cells) and j < len(new_cells):
-                _diff_cell_pair(old_cells[i], new_cells[j])
-                i += 1
-                j += 1
-                continue
-
-            # Only one side has cells left
-            if i < len(old_cells):
-                with self.diff_group():
-                    with self.context('del'):
-                        self.block_process(old_cells[i]['events'])
-                i += 1
-            elif j < len(new_cells):
-                with self.diff_group():
-                    with self.context('ins'):
-                        self.block_process(new_cells[j]['events'])
-                j += 1
-
-        # Emit closing </tr> from old wrapper.
-        self.append(*old_tr_events[-1])
 
     def _process_replace_opcode(self, old_atoms_slice, new_atoms_slice):
         """Procesa un opcode de tipo 'replace'."""
@@ -1087,7 +367,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             and old_atoms_slice[0].get('tag') == 'tr'
             and new_atoms_slice[0].get('tag') == 'tr'
         ):
-            self._diff_tr_by_cells(old_atoms_slice[0]['events'], new_atoms_slice[0]['events'])
+            diff_tr_by_cells(self, old_atoms_slice[0]['events'], new_atoms_slice[0]['events'])
             return
 
         # Special-case: whole table blocks should be diffed by rows/cells (keeps HTML valid
@@ -1100,7 +380,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             and old_atoms_slice[0].get("tag") == "table"
             and new_atoms_slice[0].get("tag") == "table"
         ):
-            self._diff_table_by_rows(old_atoms_slice[0]["events"], new_atoms_slice[0]["events"])
+            diff_table_by_rows(self, old_atoms_slice[0]["events"], new_atoms_slice[0]["events"])
             return
 
         if (_has_structural_tags(old_events) or _has_structural_tags(new_events)) and not is_pure_style_structural:
@@ -1147,9 +427,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             
             if is_structural:
                 if a_new.get('tag') == 'tr':
-                    self._diff_tr_by_cells(a_old['events'], a_new['events'])
+                    diff_tr_by_cells(self, a_old['events'], a_new['events'])
                 elif a_new.get('tag') == 'table':
-                    self._diff_table_by_rows(a_old['events'], a_new['events'])
+                    diff_table_by_rows(self, a_old['events'], a_new['events'])
                 else:
                     inner = _EventDiffer(a_old['events'], a_new['events'], self.config, diff_id_state=self._diff_id_state)
                     for ev in inner.get_diff_events():
@@ -1160,9 +440,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
                 # Visual-only attribute changes (same text, different style/class/attrs)
                 # should still produce a visible diff even when atom keys match.
-                if old_events != new_events and self._can_visual_container_replace(old_events, new_events):
+                if old_events != new_events and can_visual_container_replace(self, old_events, new_events):
                     with self.diff_group():
-                        self._render_visual_replace_inline(old_events, new_events)
+                        render_visual_replace_inline(self, old_events, new_events)
                     continue
 
                 # Whitespace-only text changes can be hidden by atomization keys
@@ -1449,449 +729,12 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             self._result = merge_adjacent_change_tags(self._result, config=self.config)
         return Stream(self._result)
 
-    def _can_unwrap_wrapper(self, old_events, new_events):
-        """
-        Detect cases like:
-          old: <strong>TEXT</strong>
-          new: TEXT
-        or the inverse. If so, we force a delete then insert at that range to
-        avoid inverted output and broken rendering in inline wrappers.
-        """
-        def is_inline_wrapper(tag):
-            return qname_localname(tag) in INLINE_FORMATTING_TAGS
-
-        def unwrap(events):
-            if len(events) >= 3 and events[0][0] == START and events[-1][0] == END:
-                tag0 = events[0][1][0]
-                tag1 = events[-1][1]
-                if tag0 == tag1 and is_inline_wrapper(tag0):
-                    inner = events[1:-1]
-                    txt = extract_text_from_events(inner)
-                    return qname_localname(tag0), txt
-            return None, None
-
-        old_tag, old_txt = unwrap(old_events)
-        new_tag, new_txt = unwrap(new_events)
-        old_plain = extract_text_from_events(old_events)
-        new_plain = extract_text_from_events(new_events)
-
-        # old wrapped -> new plain with same text
-        if old_tag and (not new_tag) and old_txt and old_txt == collapse_ws(new_plain):
-            return True
-        # old plain -> new wrapped with same text
-        if new_tag and (not old_tag) and new_txt and new_txt == collapse_ws(old_plain):
-            return True
-        return False
-
-    def _can_visual_container_replace(self, old_events, new_events):
-        """
-        Detect container/tag/attribute-only changes that should still produce a
-        visible diff:
-          <p style="...">Texto</p>  -> <p style="...">Texto</p>
-          <div id="a">X</div>       -> <div id="b">X</div>
-          <div>Texto</div>          -> <span>Texto</span>
-
-        We only apply this to a safe allowlist of tags to avoid blowing up
-        structural HTML (tables/lists).
-        """
-        if not old_events or not new_events:
-            return False
-        _lws, old_events, _tws = strip_edge_whitespace_events(old_events)
-        _lws2, new_events, _tws2 = strip_edge_whitespace_events(new_events)
-        if not old_events or not new_events:
-            return False
-        if old_events[0][0] != START or old_events[-1][0] != END:
-            return False
-        if new_events[0][0] != START or new_events[-1][0] != END:
-            return False
-
-        old_tag, old_attrs = old_events[0][1]
-        new_tag, new_attrs = new_events[0][1]
-        old_lname = qname_localname(old_tag)
-        new_lname = qname_localname(new_tag)
-
-        allowed = set(getattr(self.config, 'visual_container_tags', ()))
-        if old_lname not in allowed and new_lname not in allowed:
-            return False
-
-        old_txt = extract_text_from_events(old_events)
-        new_txt = extract_text_from_events(new_events)
-        if not old_txt or not new_txt:
-            return False
-        if collapse_ws(old_txt) != collapse_ws(new_txt):
-            return False
-
-        # Same visible text but different inline formatting structure (e.g. strong removed)
-        if structure_signature(old_events, self.config) != structure_signature(new_events, self.config):
-            return True
-
-        # If tag differs OR any tracked attribute differs, treat as visual change
-        if old_lname != new_lname:
-            return True
-        for attr in getattr(self.config, 'track_attrs', ('style', 'class', 'src', 'href')):
-            if old_attrs.get(attr) != new_attrs.get(attr):
-                return True
-        # Also consider id as a common visual/selection attribute in product HTML
-        if old_attrs.get('id') != new_attrs.get('id'):
-            return True
-
-        return False
-
-    def _wrap_inline_visual_replace(self, kind, wrapper_tag, attrs, inner_events, pos):
-        """Envuelve eventos internos en un wrapper inline para reemplazo visual."""
-        kind_tag = QName(kind)
-        wrapper_q = wrapper_tag
-        self.append(START, (kind_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
-        self.append(START, (wrapper_q, attrs), pos)
-        # Render inner events verbatim (including <br>, <strong>, etc.)
-        with self.context(None):
-            self.block_process(inner_events)
-        self.append(END, wrapper_q, pos)
-        self.append(END, kind_tag, pos)
-
-    def _wrap_block_visual_replace(self, kind, wrapper_tag, attrs, inner_events, pos):
-        """
-        Keep HTML valid by not nesting block tags inside <ins>/<del>.
-        Instead:
-          <p style=old><del>TEXT</del></p>
-          <p style=new><ins>TEXT</ins></p>
-        """
-        kind_tag = QName(kind)
-        wrapper_q = wrapper_tag
-        self.append(START, (wrapper_q, attrs), pos)
-        self.append(START, (kind_tag, self._change_attrs(diff_id=self._active_diff_id())), pos)
-        # Emit inner events without wrapping again (we are already inside <ins>/<del>),
-        # but convert <br> into a visible marker so double line breaks show an empty
-        # line with ¶ even when the change is "visual-only".
-        marker = getattr(self.config, 'linebreak_marker', u'\u00b6')
-        skip_br_end = 0
-        for et, d, p2 in inner_events:
-            if skip_br_end and et == END and qname_localname(d) == 'br':
-                skip_br_end -= 1
-                continue
-            if et == START:
-                ttag, tattrs = d
-                if qname_localname(ttag) == 'br':
-                    # inside <ins>/<del>, so plain TEXT marker is enough
-                    self.append(TEXT, marker, p2)
-                    self.append(START, (ttag, tattrs), p2)
-                    self.append(END, ttag, p2)
-                    skip_br_end += 1
-                    continue
-            self.append(et, d, p2)
-        self.append(END, kind_tag, pos)
-        self.append(END, wrapper_q, pos)
-
-    def _render_visual_replace_inline(self, old_events, new_events):
-        """
-        Inline visual replace:
-          <p style="old">TEXT</p> -> <p style="new">TEXT</p>
-        becomes:
-          <del><span style="old">TEXT</span></del><ins><span style="new">TEXT</span></ins>
-
-        This preserves reading order (del then ins) and keeps the diff inline.
-        """
-        lws_old, old_core, tws_old = strip_edge_whitespace_events(old_events)
-        lws_new, new_core, tws_new = strip_edge_whitespace_events(new_events)
-
-        # Preserve leading/trailing whitespace events (mostly new-side to keep DOM stable)
-        for ev in lws_new:
-            self.append(*ev)
-
-        old_events = old_core
-        new_events = new_core
-        if not old_events or not new_events:
-            # fallback
-            self.delete(0, 0)
-            return
-
-        # Pick a stable position for injected events
-        pos = (new_events or old_events)[0][2]
-
-        old_tag, old_attrs = old_events[0][1]
-        new_tag, new_attrs = new_events[0][1]
-
-        old_inner = old_events[1:-1]
-        new_inner = new_events[1:-1]
-
-        old_l = qname_localname(old_tag)
-        new_l = qname_localname(new_tag)
-        # Structural tags (td, th) must remain the outermost tag to keep HTML valid.
-        is_structural = (old_l in ('td', 'th') and new_l in ('td', 'th'))
-
-        # Preserve actual wrapper tags when possible:
-        # - inline wrappers: span/strong/em...
-        # - block wrappers: p/h1..h6 (titles/paragraphs)
-        # - structural: td/th
-        old_wrap = old_tag if (old_l in INLINE_FORMATTING_TAGS or old_l in BLOCK_WRAPPER_TAGS or old_l in ('td', 'th')) else QName('span')
-        new_wrap = new_tag if (new_l in INLINE_FORMATTING_TAGS or new_l in BLOCK_WRAPPER_TAGS or new_l in ('td', 'th')) else QName('span')
-
-        if is_structural:
-            # Emit the new structural tag once
-            self.append(START, (new_tag, new_attrs), pos)
-            # Then emit del/ins of content
-            self._wrap_inline_visual_replace('del', QName('span'), old_attrs, old_inner, pos)
-            self._wrap_inline_visual_replace('ins', QName('span'), new_attrs, new_inner, pos)
-            self.append(END, new_tag, pos)
-        else:
-            if old_l in BLOCK_WRAPPER_TAGS:
-                self._wrap_block_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
-            else:
-                self._wrap_inline_visual_replace('del', old_wrap, old_attrs, old_inner, pos)
-
-            if new_l in BLOCK_WRAPPER_TAGS:
-                self._wrap_block_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
-            else:
-                self._wrap_inline_visual_replace('ins', new_wrap, new_attrs, new_inner, pos)
-
-        for ev in tws_new:
-            self.append(*ev)
-
-    def _find_inline_wrapper_bounds(self, events):
-        """Encuentra los límites de un wrapper inline único en los eventos."""
-        # Find first START of inline wrapper
-        start_idx = None
-        for i, (t, d, _p) in enumerate(events):
-            if t == START and qname_localname(d[0]) in INLINE_FORMATTING_TAGS:
-                start_idx = i
-                break
-        if start_idx is None:
-            return None, None
-
-        # Find matching END for that wrapper (non-nested heuristic)
-        wname = qname_localname(events[start_idx][1][0])
-        depth = 0
-        end_idx = None
-        for j in range(start_idx, len(events)):
-            t, d, _p = events[j]
-            if t == START and qname_localname(d[0]) == wname:
-                depth += 1
-            elif t == END and qname_localname(d) == wname:
-                depth -= 1
-                if depth == 0:
-                    end_idx = j
-                    break
-        if end_idx is None:
-            return None, None
-
-        # Ensure there are no other inline wrapper starts outside this subtree
-        for i, (t, d, _p) in enumerate(events):
-            if i < start_idx or i > end_idx:
-                if t == START and qname_localname(d[0]) in INLINE_FORMATTING_TAGS:
-                    return None, None
-
-        return start_idx, end_idx
-
-    def _validate_prefix_suffix_alignment(self, prefix_text, suffix_text, old_text, new_text):
-        """Valida que el prefijo y sufijo común estén alineados correctamente."""
-        pre_len = longest_common_prefix_len(old_text, new_text)
-        suf_len = longest_common_suffix_len(old_text, new_text, max_prefix=pre_len)
-        return pre_len == len(prefix_text) and suf_len == len(suffix_text)
-
-    def _try_inline_wrapper_to_plain(self, old_events, new_events):
-        """
-        Handle patterns like:
-          <p>Texto <u>subrayado</u></p> -> <p>Texto normal</p>
-        without marking the unchanged prefix ("Texto ") as del/ins.
-
-        This only triggers when:
-        - new is a single TEXT event (within the compared range)
-        - old has exactly one inline wrapper segment (span/strong/b/em/i/u)
-        - common prefix/suffix align cleanly with old's leading/trailing TEXT events
-        """
-        if len(new_events) != 1 or new_events[0][0] != TEXT:
-            return False
-        if not old_events:
-            return False
-
-        # Identify a single inline wrapper subtree inside old_events
-        start_idx, end_idx = self._find_inline_wrapper_bounds(old_events)
-        if start_idx is None or end_idx is None:
-            return False
-
-        # Split old events into prefix TEXT (before wrapper), wrapper subtree, suffix TEXT (after wrapper)
-        prefix_events = old_events[:start_idx]
-        wrapper_events = old_events[start_idx:end_idx + 1]
-        suffix_events = old_events[end_idx + 1:]
-
-        old_text = raw_text_from_events(old_events)
-        new_text = new_events[0][1] or u''
-        prefix_text = raw_text_from_events(prefix_events)
-        suffix_text = raw_text_from_events(suffix_events)
-
-        # Validate prefix/suffix alignment
-        if not self._validate_prefix_suffix_alignment(prefix_text, suffix_text, old_text, new_text):
-            return False
-
-        # Compute common prefix/suffix on raw strings
-        pre_len = longest_common_prefix_len(old_text, new_text)
-        suf_len = longest_common_suffix_len(old_text, new_text, max_prefix=pre_len)
-
-        # Remaining new text that replaces the wrapper subtree
-        mid_new = new_text[pre_len:len(new_text) - suf_len if suf_len else len(new_text)]
-
-        # Emit prefix unchanged
-        if prefix_text:
-            pos = (prefix_events[-1][2] if prefix_events else new_events[0][2])
-            self.append(TEXT, prefix_text, pos)
-
-        # Emit deletion preserving wrapper formatting, then insertion of the replacement text
-        with self.context('del'):
-            self.block_process(wrapper_events)
-        if mid_new:
-            self.mark_text(new_events[0][2], mid_new, 'ins')
-
-        # Emit suffix unchanged
-        if suffix_text:
-            self.append(TEXT, suffix_text, new_events[0][2])
-
-        return True
 
 
-class _EventDiffer(StreamDiffer):
-    """
-    Internal differ used for replace blocks, operating directly on event lists.
-    It bypasses atomization to avoid recursive re-grouping side-effects.
-    """
+# Import _EventDiffer factory function (will be created after StreamDiffer is defined)
+from .event_differ import create_event_differ_class
 
-    def __init__(self, old_events, new_events, config, diff_id_state=None):
-        self.config = config or DiffConfig()
-        # IMPORTANT: Keep original TEXT events intact and let diff_text() handle
-        # word-level granularity. Splitting TEXT here can cause insertions to
-        # appear "inside" deletions for phrase replacements.
-        self._old_events = list(old_events)
-        self._new_events = list(new_events)
-        self._old_atoms = None
-        self._new_atoms = None
-        self._result = []
-        self._stack = []
-        self._context = None
-        self._skip_end_for = []
-        self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
-        self._diff_id_state = diff_id_state if diff_id_state is not None else [0]
-        self._diff_id_stack = []
-
-    def get_diff_events(self):
-        self.process_events()
-        return self._result
-
-    def _handle_table_cell_wrapper_pattern(self, opcodes, k):
-        """
-        Maneja el patrón especial de tabla donde se agrega un wrapper inline estilizado
-        alrededor del texto existente de una celda/encabezado.
-        """
-        if k + 2 >= len(opcodes):
-            return False
-        
-        t1, a1, a2, b1, b2 = opcodes[k]
-        t2, c1, c2, d1, d2 = opcodes[k + 1]
-        t3, _e1, _e2, f1, f2 = opcodes[k + 2]
-        
-        # Pattern: replace(START) + equal(TEXT) + insert(wrapper END)
-        if not (t1 == 'replace' and t2 == 'equal' and t3 == 'insert' and 
-                (a2 - a1) == 1 and (c2 - c1) == 1 and (d2 - d1) == 1 and (b2 - b1) >= 2):
-            return False
-        
-        old_start_ev = self._old_events[a1]
-        old_text_ev = self._old_events[c1]
-        new_text_ev = self._new_events[d1]
-        
-        if not (old_start_ev[0] == START and old_text_ev[0] == TEXT and new_text_ev[0] == TEXT):
-            return False
-        
-        new_start_ev = self._new_events[b1]
-        if new_start_ev[0] != START:
-            return False
-        
-        cont_tag, cont_attrs_new = new_start_ev[1]
-        cont_l = qname_localname(cont_tag)
-        if cont_l not in ('th', 'td'):
-            return False
-        
-        # Find wrapper with visual attrs
-        wrapper_idx = None
-        wrapper_tag = None
-        wrapper_attrs = None
-        for j in range(b1 + 1, b2):
-            ev = self._new_events[j]
-            if ev[0] == START:
-                w_tag, w_attrs = ev[1]
-                w_l = qname_localname(w_tag)
-                if w_l in INLINE_FORMATTING_TAGS and has_visual_attrs(w_attrs, self.config):
-                    wrapper_idx = j
-                    wrapper_tag, wrapper_attrs = w_tag, w_attrs
-        
-        if wrapper_idx is None or (f2 - f1) < 1:
-            return False
-        
-        end_ev = self._new_events[f1]
-        if not (end_ev[0] == END and qname_localname(end_ev[1]) == qname_localname(wrapper_tag)):
-            return False
-        
-        if collapse_ws(old_text_ev[1]) != collapse_ws(new_text_ev[1]):
-            return False
-        
-        # Render the pattern
-        old_cont_attrs = old_start_ev[1][1]
-        self.enter_mark_replaced(new_start_ev[2], cont_tag, cont_attrs_new, old_cont_attrs)
-        # whitespace between container and wrapper
-        for j in range(b1 + 1, wrapper_idx):
-            self.append(*self._new_events[j])
-        # wrapper START marked replaced
-        w_attrs2 = Attrs(list(wrapper_attrs))
-        w_attrs2 = self.inject_class(w_attrs2, 'tagdiff_replaced')
-        w_attrs2 |= [(QName('data-old-tag'), 'none')]
-        if getattr(self.config, 'add_diff_ids', False):
-            diff_id = self._active_diff_id() or self._new_diff_id()
-            w_attrs2 = self._set_attr(w_attrs2, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-        self.enter(self._new_events[wrapper_idx][2], wrapper_tag, w_attrs2)
-        # shared TEXT once
-        self.append(TEXT, old_text_ev[1], new_text_ev[2])
-        # close wrapper and emit remaining insert tail (indentation)
-        self.leave(end_ev[2], end_ev[1])
-        for j in range(f1 + 1, f2):
-            self.append(*self._new_events[j])
-        
-        return True
-
-    def process_events(self):
-        # Fast path: treat visual-only container changes as a single replace so we can
-        # render del->ins even when SequenceMatcher only flags the START tag.
-        if should_force_visual_replace(self._old_events, self._new_events, self.config):
-            self.replace(0, len(self._old_events), 0, len(self._new_events))
-            self.leave_all()
-            return
-
-        matcher = SequenceMatcher(None, self._old_events, self._new_events)
-        opcodes = matcher.get_opcodes()
-        if getattr(self.config, 'delete_first', True):
-            opcodes = normalize_opcodes_for_delete_first(opcodes)
-        opcodes = normalize_inline_wrapper_opcodes(opcodes, self._old_events, self._new_events)
-        opcodes = normalize_inline_wrapper_tag_change_opcodes(opcodes, self._old_events, self._new_events, self.config)
-
-        # Table-aware special-case: styled inline wrapper added around an existing
-        # cell/header text should be marked as tagdiff_replaced without duplicating
-        # the text (no del+ins copy).
-
-        k = 0
-        while k < len(opcodes):
-            # Try to handle table cell wrapper pattern
-            if self._handle_table_cell_wrapper_pattern(opcodes, k):
-                k += 3
-                continue
-
-            tag, i1, i2, j1, j2 = opcodes[k]
-            if tag == 'replace':
-                self.replace(i1, i2, j1, j2)
-            elif tag == 'delete':
-                with self.diff_group():
-                    self.delete(i1, i2)
-            elif tag == 'insert':
-                with self.diff_group():
-                    self.insert(j1, j2)
-            else:
-                self.unchanged(i1, i2)
-            k += 1
-        self.leave_all()
+# Create _EventDiffer class now that StreamDiffer is fully defined
+_EventDiffer = create_event_differ_class(StreamDiffer)
 
 
