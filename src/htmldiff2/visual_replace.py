@@ -272,7 +272,8 @@ def render_visual_replace_inline(differ, old_events, new_events):
     old_l = qname_localname(old_tag)
     new_l = qname_localname(new_tag)
     # Structural tags (td, th, li) must remain the outermost tag to keep HTML valid.
-    is_structural = (old_l in ('td', 'th', 'li') and new_l in ('td', 'th', 'li'))
+    # If the target tag is structural, we must use it as the wrapper.
+    is_structural = (new_l in ('td', 'th', 'li'))
 
     # Preserve actual wrapper tags when possible:
     # - inline wrappers: span/strong/em...

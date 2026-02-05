@@ -709,9 +709,9 @@ def test_paragraphs_converted_to_list_wrapped_correctly():
     # We look for LI with tagdiff_deleted/added containing a DEL/INS
     import re
     
-    # Matches <li ... class="...tagdiff_deleted..." ...><del
-    # We need to account for arbitrary attributes and spacing
-    li_del_pattern = r'<li[^>]*class=["\'][^"\']*tagdiff_(deleted|added)[^"\']*["\'][^>]*>\s*<(del|ins)'
+    # Matches <li...><del... or <li...><ins...
+    # We allow standard <li> wrapper (from visual replace) OR tagdiff <li> wrapper (block replace)
+    li_del_pattern = r'<li[^>]*>\s*<(del|ins)'
     assert re.search(li_del_pattern, out), f"Did not find wrapped list item in output: {out}"
     
     # Verify we don't have the invalid structure
@@ -1213,3 +1213,40 @@ def test_table_cell_text_change_no_extra_column():
     assert "No disponible" in out, "Should contain old (deleted) text"
     assert "25 de septiembre" in out, "Should contain new (inserted) text"
 
+
+def test_li_style_change_shows_del_ins():
+    """LI style changes should show visible del/ins, not just tagdiff_replaced class.
+    
+    When an LI gets a style attribute added (e.g., font-size: 20pt), the diff
+    should show <del>/<ins> markers so the frontend can display the change
+    visually without needing special CSS for tagdiff_replaced.
+    """
+    old = """
+<ul>
+<li>Tejidos blandos sin alteraciones.</li>
+<li>Estructuras óseas de adecuada radiodensidad.</li>
+</ul>
+"""
+    new = """
+<ol>
+<li style="font-size: 20pt;">Tejidos blandos sin alteraciones.</li>
+<li style="font-size: 20pt;">Estructuras óseas de adecuada radiodensidad.</li>
+</ol>
+"""
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+    
+    # Should have del/ins markers (not just tagdiff_replaced class)
+    assert '<del' in out and '<ins' in out, "Should have visible del/ins markers"
+    
+    # Should NOT rely solely on tagdiff_replaced
+    import re
+    li_tags = re.findall(r'<li[^>]*>', out)
+    assert len(li_tags) >= 2, "Should have LI elements preserved"
+    
+    # Each LI should contain del and ins (visible markers inside)
+    for i, li_match in enumerate(re.finditer(r'<li[^>]*>(.*?)</li>', out, re.DOTALL)):
+        li_content = li_match.group(1)
+        assert '<del' in li_content or '<ins' in li_content, \
+            f"LI {i+1} should have del/ins inside, got: {li_content[:100]}..."

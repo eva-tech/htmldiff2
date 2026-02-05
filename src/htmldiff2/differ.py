@@ -413,6 +413,17 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                     self.block_process(concat_events([a_old]))
                 continue
             
+            # Special case: Paragraph <-> List Item transition with matching text
+            # (bullet stripping in atomization makes keys equal).
+            # Force inner diff to show granular "-" deletion / bullet insertion.
+            old_t = a_old.get('tag')
+            new_t = a_new.get('tag')
+            if (old_t == 'p' and new_t == 'li') or (old_t == 'li' and new_t == 'p'):
+                 inner = _EventDiffer(a_old['events'], a_new['events'], self.config, diff_id_state=self._diff_id_state)
+                 for ev in inner.get_diff_events():
+                     self.append(*ev)
+                 continue
+
             # Si el texto es igual pero los tags son distintos (ej: <p> -> <li>), 
             # forzamos un bloque diff atómico con un solo ID.
             if a_new.get('kind') == 'block' and a_old.get('kind') == 'block' and a_old['events'][0][1][0] != a_new['events'][0][1][0]:

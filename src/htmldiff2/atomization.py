@@ -3,11 +3,15 @@
 Funciones de atomización de eventos para mejor alineación en diffs.
 """
 from genshi.core import START, END, TEXT
+import re
 from .config import STRUCTURAL_TAGS
 from .utils import (
     qname_localname, extract_text_from_events, collapse_ws,
     attrs_signature, structure_signature, is_diff_wrapper
 )
+
+
+_list_marker_re = re.compile(r'^[\-\*\•\+]+\s+')
 
 
 def _first_n_cell_texts_from_tr_events(tr_events, n=2):
@@ -124,7 +128,9 @@ def create_block_atom_key(lname, block_events, attrs, config, visual_tags):
         # initial alignment. This allows a paragraph to match a list item
         # if the text is identical, while the tag change is handled later.
         # Include a 'block' marker to distinguish from raw text atoms.
-        return ('block', block_text)
+        # Also strip common list markers (-, *, •) to allow "- Item" (p) to match "Item" (li).
+        normalized_text = _list_marker_re.sub('', block_text)
+        return ('block', normalized_text)
     elif lname in ('ul', 'ol'):
         # Force these containers to always be 'equal' in the outer matcher
         # so we always run an inner diff on their children.
