@@ -855,7 +855,11 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         new_align = [_align_key(c) for c in new_cells]
 
         def _diff_cell_pair(old_cell, new_cell):
-            """Diff one old/new cell (td/th), preserving structure."""
+            """Diff one old/new cell (td/th), preserving structure.
+            
+            When text differs, emit a SINGLE cell wrapper with inline del/ins
+            for the content, instead of two separate cells (which creates an extra column).
+            """
             # If the visible text is the same, prefer an inner diff so style/attrs
             # changes do NOT shift column alignment.
             if _align_key(old_cell) == _align_key(new_cell):
@@ -863,11 +867,44 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 for ev in inner.get_diff_events():
                     self.append(*ev)
                 return
+            
+            # Text differs: emit SINGLE cell with inline del/ins content.
+            # Use old cell's wrapper (preserves original structure/attrs).
+            old_events = old_cell['events']
+            new_events = new_cell['events']
+            
+            # Find the cell wrapper START and END
+            # old_events[0] = (START, (tag, attrs), pos)
+            # old_events[-1] = (END, tag, pos)
+            if not old_events or old_events[0][0] != START or old_events[-1][0] != END:
+                # Fallback: emit both cells (shouldn't happen)
+                with self.diff_group():
+                    with self.context('del'):
+                        self.block_process(old_events)
+                    with self.context('ins'):
+                        self.block_process(new_events)
+                return
+            
+            cell_start = old_events[0]
+            cell_end = old_events[-1]
+            old_content = old_events[1:-1]  # Content between <td> and </td>
+            new_content = new_events[1:-1] if len(new_events) > 2 else []
+            
+            # Emit single cell wrapper
+            self.append(*cell_start)
+            
             with self.diff_group():
-                with self.context('del'):
-                    self.block_process(old_cell['events'])
-                with self.context('ins'):
-                    self.block_process(new_cell['events'])
+                # Deleted content
+                if old_content:
+                    with self.context('del'):
+                        self.block_process(old_content)
+                # Inserted content
+                if new_content:
+                    with self.context('ins'):
+                        self.block_process(new_content)
+            
+            # Close cell
+            self.append(*cell_end)
 
         def _best_single_delete_index(oldk, newk):
             """
@@ -992,12 +1029,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 continue
 
             # Same remaining length but different keys => treat as replace (paired).
+            # Use _diff_cell_pair to emit SINGLE cell with inline del/ins.
             if i < len(old_cells) and j < len(new_cells):
-                with self.diff_group():
-                    with self.context('del'):
-                        self.block_process(old_cells[i]['events'])
-                    with self.context('ins'):
-                        self.block_process(new_cells[j]['events'])
+                _diff_cell_pair(old_cells[i], new_cells[j])
                 i += 1
                 j += 1
                 continue

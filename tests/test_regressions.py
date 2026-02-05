@@ -1168,3 +1168,48 @@ def test_br_inside_del_when_deleting_linebreaks():
             f"Should find <br> inside <del> tag when both are present. "
             f"Output: {out[:1000]}"
         )
+
+
+def test_table_cell_text_change_no_extra_column():
+    """
+    Test that when text inside a table cell changes, the output has inline
+    del/ins inside a SINGLE cell, NOT two separate cells (which creates extra column).
+    """
+    old = """
+<table border="1">
+<tbody>
+<tr>
+<td><strong>Estudio Previo</strong></td>
+<td>No disponible para comparación.</td>
+</tr>
+</tbody>
+</table>
+"""
+    new = """
+<table ref="7">
+<tbody>
+<tr>
+<td><strong>Estudio Previo</strong></td>
+<td>25 de septiembre del 2025</td>
+</tr>
+</tbody>
+</table>
+"""
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+    
+    # The first row should have exactly 2 TD elements
+    import re
+    first_row_match = re.search(r'<tr[^>]*>(.*?)</tr>', out, re.DOTALL)
+    assert first_row_match, "Should find a <tr> element"
+    first_row = first_row_match.group(1)
+    td_count = len(re.findall(r'<td', first_row))
+    assert td_count == 2, f"Expected 2 TDs, got {td_count}. Row: {first_row}"
+    
+    # The second cell should contain both del and ins (inline change)
+    assert '<del' in out and '<ins' in out, "Should have inline del/ins"
+    # Old and new content should be present
+    assert "No disponible" in out, "Should contain old (deleted) text"
+    assert "25 de septiembre" in out, "Should contain new (inserted) text"
+
