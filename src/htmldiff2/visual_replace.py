@@ -271,15 +271,15 @@ def render_visual_replace_inline(differ, old_events, new_events):
 
     old_l = qname_localname(old_tag)
     new_l = qname_localname(new_tag)
-    # Structural tags (td, th) must remain the outermost tag to keep HTML valid.
-    is_structural = (old_l in ('td', 'th') and new_l in ('td', 'th'))
+    # Structural tags (td, th, li) must remain the outermost tag to keep HTML valid.
+    is_structural = (old_l in ('td', 'th', 'li') and new_l in ('td', 'th', 'li'))
 
     # Preserve actual wrapper tags when possible:
     # - inline wrappers: span/strong/em...
     # - block wrappers: p/h1..h6 (titles/paragraphs)
     # - structural: td/th
-    old_wrap = old_tag if (old_l in INLINE_FORMATTING_TAGS or old_l in BLOCK_WRAPPER_TAGS or old_l in ('td', 'th')) else QName('span')
-    new_wrap = new_tag if (new_l in INLINE_FORMATTING_TAGS or new_l in BLOCK_WRAPPER_TAGS or new_l in ('td', 'th')) else QName('span')
+    old_wrap = old_tag if (old_l in INLINE_FORMATTING_TAGS or old_l in BLOCK_WRAPPER_TAGS or old_l in ('td', 'th', 'li')) else QName('span')
+    new_wrap = new_tag if (new_l in INLINE_FORMATTING_TAGS or new_l in BLOCK_WRAPPER_TAGS or new_l in ('td', 'th', 'li')) else QName('span')
 
     if is_structural:
         # Emit the new structural tag once

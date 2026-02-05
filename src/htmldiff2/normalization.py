@@ -182,7 +182,7 @@ def should_force_visual_replace(old_events, new_events, config):
     if structure_signature(old_events, config) != structure_signature(new_events, config):
         if old_lname in INLINE_FORMATTING_TAGS or new_lname in INLINE_FORMATTING_TAGS:
             return True
-        if old_lname in ('td', 'th'):
+        if old_lname in ('td', 'th', 'li'):
             return True
         if old_lname in BLOCK_WRAPPER_TAGS or new_lname in BLOCK_WRAPPER_TAGS:
             return False
