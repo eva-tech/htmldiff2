@@ -452,6 +452,38 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 # Visual-only attribute changes (same text, different style/class/attrs)
                 # should still produce a visible diff even when atom keys match.
                 if old_events != new_events and can_visual_container_replace(self, old_events, new_events):
+                    # Check if the structure differs (e.g. <strong> tags added/removed).
+                    # If so, run a granular inner diff on children instead of full block replace.
+                    old_sig = structure_signature(old_events, self.config)
+                    new_sig = structure_signature(new_events, self.config)
+                    
+                    if old_sig != new_sig:
+                        # Structure differs - use specialized inline formatting diff
+                        # that preserves unchanged text and only marks formatting changes.
+                        from .diff_inline_formatting import diff_inline_formatting
+                        if diff_inline_formatting(self, old_events, new_events):
+                            continue
+                        
+                        # Fallback: if text doesn't match, use standard inner diff
+                        if (old_events and new_events and
+                            old_events[0][0] == START and new_events[0][0] == START and
+                            old_events[-1][0] == END and new_events[-1][0] == END):
+                            
+                            (cont_tag, cont_attrs) = new_events[0][1]
+                            cont_pos = new_events[0][2]
+                            self.enter(cont_pos, cont_tag, cont_attrs)
+                            
+                            old_children = old_events[1:-1]
+                            new_children = new_events[1:-1]
+                            
+                            inner = _EventDiffer(old_children, new_children, self.config, diff_id_state=self._diff_id_state)
+                            for ev in inner.get_diff_events():
+                                self.append(*ev)
+                            
+                            self.leave(new_events[-1][2], new_events[-1][1])
+                            continue
+                    
+                    # Attribute-only change (same structure) - use visual replace
                     with self.diff_group():
                         render_visual_replace_inline(self, old_events, new_events)
                     continue
