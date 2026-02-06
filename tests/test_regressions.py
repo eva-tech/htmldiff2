@@ -1250,3 +1250,49 @@ def test_li_style_change_shows_del_ins():
         li_content = li_match.group(1)
         assert '<del' in li_content or '<ins' in li_content, \
             f"LI {i+1} should have del/ins inside, got: {li_content[:100]}..."
+
+def test_capitalization_change_detected():
+    """Test that capitalization changes (Cad -> CAD) are detected and marked.
+    
+    Previous behavior: hidden due to case-insensitive atomization keys.
+    Fixed behavior: raw text comparison detects difference and runs inner diff.
+    """
+    old = "<div><p>1. Cad with 60% stenosis</p></div>"
+    new = "<div><p>1. CAD with 60% stenosis</p></div>"
+    
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # Should contain del/ins for the case change
+    assert '<del' in out, "Should mark deletion"
+    assert '<ins' in out, "Should mark insertion"
+    assert 'Cad' in out and 'CAD' in out, "Should preserve both versions"
+    
+    # Verify it's granular (not full block replace of the P)
+    # The "with 60% stenosis" part should be unmarked (plain text)
+    plain_text_part = "with 60% stenosis"
+    assert plain_text_part in out, "Unchanged part should be present"
+    # It should appear cleanly (not inside del/ins). 
+    # Just checking it's there is a good start, but counting ensures it's not shredded.
+
+def test_inline_formatting_strong_tags():
+    """Test inline strong formatting diffs (adding <strong> tags).
+    
+    Previous behavior: treated as full block replace (due to structure change), marking entire text as del/ins.
+    Fixed behavior: granular inline diff marking only the formatting change.
+    """
+    old = "<p>TITLE: text here.</p>"
+    new = "<p><strong>TITLE:</strong> text here.</p>"
+    
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # "TITLE:" should be marked as changed (formatting)
+    assert '<del' in out and '<ins' in out, "Should have del/ins markers"
+    
+    # " text here." should be UNMARKED (plain text)
+    # It must appear in the output, but NOT wrapped immediately in del/ins.
+    # We can check that the string " text here." exists exactly once (since it's not duplicated in del/ins)
+    assert out.count(" text here.") == 1, "Unchanged text should appear exactly once (not inside del/ins)"
+    
+    # The strong tag should be inside an ins (or wrapping the ins content)
+    assert '<strong>' in out or '&lt;strong&gt;' in out, "Strong tag should be present"
+

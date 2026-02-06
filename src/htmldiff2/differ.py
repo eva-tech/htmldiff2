@@ -514,6 +514,31 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                     except Exception:
                         # If anything goes wrong, fall back to unchanged rendering.
                         pass
+                
+                # Case-only text changes (e.g. "Cad" -> "CAD") are hidden by atomization
+                # keys using .lower(). Detect when raw text differs and run inner diff.
+                if old_events != new_events:
+                    old_raw = raw_text_from_events(old_events)
+                    new_raw = raw_text_from_events(new_events)
+                    if old_raw != new_raw:
+                        # Text differs - run inner diff for granular marking
+                        if (old_events and new_events and
+                            old_events[0][0] == START and new_events[0][0] == START and
+                            old_events[-1][0] == END and new_events[-1][0] == END):
+                            
+                            (cont_tag, cont_attrs) = new_events[0][1]
+                            cont_pos = new_events[0][2]
+                            self.enter(cont_pos, cont_tag, cont_attrs)
+                            
+                            old_children = old_events[1:-1]
+                            new_children = new_events[1:-1]
+                            
+                            inner = _EventDiffer(old_children, new_children, self.config, diff_id_state=self._diff_id_state)
+                            for ev in inner.get_diff_events():
+                                self.append(*ev)
+                            
+                            self.leave(new_events[-1][2], new_events[-1][1])
+                            continue
 
                 # If atoms compare equal by key but differ in event streams due to
                 # non-textual "void" elements (e.g. <img>), run an inner event diff
