@@ -1296,3 +1296,21 @@ def test_inline_formatting_strong_tags():
     # The strong tag should be inside an ins (or wrapping the ins content)
     assert '<strong>' in out or '&lt;strong&gt;' in out, "Strong tag should be present"
 
+def test_style_order_does_not_trigger_diff():
+    """Test that CSS style properties in different order are recognized as equivalent.
+    
+    Previous behavior: "font-size: 20px; text-align: center" vs "text-align: center; font-size: 20px"
+    was incorrectly detected as a change.
+    Fixed behavior: Style properties are normalized (sorted) before comparison.
+    """
+    old = '<p style="font-size: 20px; text-align: center;">Texto centrado</p>'
+    new = '<p style="text-align: center; font-size: 20px;">Texto centrado</p>'
+    
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # Should NOT detect any change (same styles, different order)
+    assert '<del' not in out, "Should NOT mark any deletions"
+    assert '<ins' not in out, "Should NOT mark any insertions"
+    assert "Texto centrado" in out, "Text should be present"
+
+

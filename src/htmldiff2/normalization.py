@@ -3,7 +3,7 @@
 Funciones de normalización de opcodes para mejorar la calidad del diff.
 """
 from genshi.core import START, END, TEXT
-from .utils import qname_localname, extract_text_from_events, collapse_ws, structure_signature
+from .utils import qname_localname, extract_text_from_events, collapse_ws, structure_signature, normalize_style_value
 from .config import INLINE_FORMATTING_TAGS, BLOCK_WRAPPER_TAGS
 
 
@@ -191,7 +191,13 @@ def should_force_visual_replace(old_events, new_events, config):
     if 'id' not in keys:
         keys.append('id')
     for k in keys:
-        if old_attrs.get(k) != new_attrs.get(k):
+        old_v = old_attrs.get(k)
+        new_v = new_attrs.get(k)
+        # Normalize style values to be order-independent
+        if k == 'style':
+            old_v = normalize_style_value(old_v) if old_v else None
+            new_v = normalize_style_value(new_v) if new_v else None
+        if old_v != new_v:
             return True
     return False
 

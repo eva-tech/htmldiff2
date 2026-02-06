@@ -14,7 +14,7 @@ from .utils import (
     extract_text_from_events, raw_text_from_events, concat_events,
     longest_common_prefix_len, longest_common_suffix_len,
     has_visual_attrs, attrs_signature, structure_signature,
-    merge_adjacent_change_tags
+    merge_adjacent_change_tags, events_equal_normalized
 )
 from .atomization import atomize_events
 from .normalization import (
@@ -451,7 +451,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
 
                 # Visual-only attribute changes (same text, different style/class/attrs)
                 # should still produce a visible diff even when atom keys match.
-                if old_events != new_events and can_visual_container_replace(self, old_events, new_events):
+                if not events_equal_normalized(old_events, new_events) and can_visual_container_replace(self, old_events, new_events):
                     # Check if the structure differs (e.g. <strong> tags added/removed).
                     # If so, run a granular inner diff on children instead of full block replace.
                     old_sig = structure_signature(old_events, self.config)
@@ -493,7 +493,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 # is a simple container with a single TEXT child, and the only
                 # difference is whitespace multiplicity, run an inner event diff so
                 # deleted/inserted spaces become visible.
-                if old_events != new_events:
+                if not events_equal_normalized(old_events, new_events):
                     try:
                         if (
                             len(old_events) == 3
@@ -517,7 +517,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 
                 # Case-only text changes (e.g. "Cad" -> "CAD") are hidden by atomization
                 # keys using .lower(). Detect when raw text differs and run inner diff.
-                if old_events != new_events:
+                if not events_equal_normalized(old_events, new_events):
                     old_raw = raw_text_from_events(old_events)
                     new_raw = raw_text_from_events(new_events)
                     if old_raw != new_raw:
@@ -544,7 +544,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                 # non-textual "void" elements (e.g. <img>), run an inner event diff
                 # so additions/removals become visible as <ins>/<del>.
                 force_tags = set(getattr(self.config, 'force_event_diff_on_equal_for_tags', ()))
-                if force_tags and old_events != new_events:
+                if force_tags and not events_equal_normalized(old_events, new_events):
                     def _has_force_tag(events):
                         for et, d, _p in events:
                             if et == START:

@@ -119,9 +119,31 @@ def is_diff_wrapper(tag, attrs):
     return False
 
 
+def normalize_style_value(style_str):
+    """
+    Normalize CSS style string by parsing properties and sorting alphabetically.
+    This makes "font-size: 20px; text-align: center" equal to "text-align: center; font-size: 20px".
+    """
+    if not style_str:
+        return ''
+    # Split by semicolon, strip whitespace, filter empty
+    parts = [p.strip() for p in style_str.split(';') if p.strip()]
+    # Parse each property into (name, value) and normalize whitespace
+    normalized = []
+    for part in parts:
+        if ':' in part:
+            name, value = part.split(':', 1)
+            # Normalize: lowercase name, strip whitespace
+            normalized.append(f"{name.strip().lower()}: {value.strip()}")
+    # Sort alphabetically by property name
+    normalized.sort()
+    return '; '.join(normalized)
+
+
 def attrs_signature(attrs, config):
     """
     Produce a stable signature for attributes we consider meaningful for matching.
+    Style attributes are normalized (sorted) so order doesn't affect comparison.
     """
     keys = list(getattr(config, 'track_attrs', ('style', 'class', 'src', 'href')))
     if 'id' not in keys:
@@ -130,8 +152,49 @@ def attrs_signature(attrs, config):
     for k in keys:
         v = attrs.get(k)
         if v is not None:
+            # Normalize style values to be order-independent
+            if k == 'style':
+                v = normalize_style_value(v)
             sig.append((k, text_type(v)))
     return tuple(sig)
+
+
+def normalize_event_for_comparison(event):
+    """
+    Normalize a single event for comparison, particularly normalizing style attributes.
+    Returns a comparable tuple representation.
+    """
+    etype, data, pos = event
+    if etype == START:
+        tag, attrs = data
+        # Normalize style attribute if present
+        normalized_attrs = {}
+        try:
+            for k, v in attrs:
+                k_str = text_type(k)
+                if k_str == 'style':
+                    normalized_attrs[k_str] = normalize_style_value(v)
+                else:
+                    normalized_attrs[k_str] = text_type(v) if v else v
+        except Exception:
+            # If attrs is not iterable, just use it as-is
+            return (etype, data, pos)
+        return (etype, (tag, tuple(sorted(normalized_attrs.items()))), pos)
+    return event
+
+
+def events_equal_normalized(old_events, new_events):
+    """
+    Compare two event lists with normalized style attributes.
+    Returns True if they are equivalent (ignoring style property order).
+    """
+    if len(old_events) != len(new_events):
+        return False
+    for old_ev, new_ev in zip(old_events, new_events):
+        if normalize_event_for_comparison(old_ev) != normalize_event_for_comparison(new_ev):
+            return False
+    return True
+
 
 
 def structure_signature(events, config):
