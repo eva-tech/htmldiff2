@@ -1314,3 +1314,47 @@ def test_style_order_does_not_trigger_diff():
     assert "Texto centrado" in out, "Text should be present"
 
 
+def test_ul_to_ol_nesting_fix():
+    """Test that changing UL to OL produces siblings, not nested invalid HTML.
+    
+    Issue: Previously, UL->OL change logic split the tag change from content matching,
+    causing normalize_inline_wrapper... to merge them into a 'replace' that
+    EventDiffer rendered as nested: <ul del><ol ins>LIs</ol></ul> (invalid).
+    
+    Fix: UL/OL are now atomized as blocks, forcing full block replacement:
+    <ul del>LIs</ul><ol ins>LIs</ol>.
+    """
+    old = """
+    <ul>
+    <li>Item 1</li>
+    <li>Item 2</li>
+    </ul>
+    """
+    new = """
+    <ol>
+    <li>Item 1</li>
+    <li>Item 2</li>
+    </ol>
+    """
+    
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # Needs to confirm Valid HTML structure (siblings)
+    # Check that we have a closed UL before the OL starts (or vice versa depending on del/ins order)
+    # Typically: <ul ...>...</ul> <ol ...>...</ol>
+    
+    # We can check that <ol is NOT inside <ul ...>
+    # Simple regex check for nesting: <ul[^>]*>.*<ol
+    # But since content is duplicated, we just check that we have <ul...</ul> and <ol...</ol>
+    
+    assert out.count('Item 1') >= 2, "Content should be duplicated (del + ins)"
+    assert '</ul>' in out
+    assert '</ol>' in out
+    
+    # Check that we DO NOT have the invalid invalid pattern: <ul ...><ol ...>
+    import re
+    nesting_pattern = re.search(r'<ul[^>]*tagdiff_deleted[^>]*>\s*<ol[^>]*tagdiff_added', out)
+    assert not nesting_pattern, "Should NOT nest OL inside UL directly"
+
+
+
