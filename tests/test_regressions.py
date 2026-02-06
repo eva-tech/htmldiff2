@@ -1339,22 +1339,26 @@ def test_ul_to_ol_nesting_fix():
     
     out = htmldiff2.render_html_diff(old, new)
     
-    # Needs to confirm Valid HTML structure (siblings)
-    # Check that we have a closed UL before the OL starts (or vice versa depending on del/ins order)
-    # Typically: <ul ...>...</ul> <ol ...>...</ol>
+    # Updated Behavior:
+    # Instead of full block replacement (del UL + ins OL), we now support "Granular Tag Replacement".
+    # Since only the container tag name changed (ul -> ol) and structure is preserved,
+    # we emit a single OL tag marked as 'tagdiff_replaced' with 'data-old-tag="ul"'.
+    # The content inside remains UNMARKED (equal), avoiding diff noise.
     
-    # We can check that <ol is NOT inside <ul ...>
-    # Simple regex check for nesting: <ul[^>]*>.*<ol
-    # But since content is duplicated, we just check that we have <ul...</ul> and <ol...</ol>
+    # Check for tagdiff_replaced on OL
+    assert 'tagdiff_replaced' in out
+    assert 'data-old-tag="ul"' in out
     
-    assert out.count('Item 1') >= 2, "Content should be duplicated (del + ins)"
-    assert '</ul>' in out
+    # Content should NOT be duplicated now (it is shared/equal)
+    # The items should appear exactly once (or as many times as in input) without del/ins
+    assert out.count('Item 1') == 1, "Content should be present once (shared)"
+    assert '<del>Item 1</del>' not in out
+    assert '<ins>Item 1</ins>' not in out
+    
+    # Check valid structure (closed OL)
     assert '</ol>' in out
-    
-    # Check that we DO NOT have the invalid invalid pattern: <ul ...><ol ...>
-    import re
-    nesting_pattern = re.search(r'<ul[^>]*tagdiff_deleted[^>]*>\s*<ol[^>]*tagdiff_added', out)
-    assert not nesting_pattern, "Should NOT nest OL inside UL directly"
+    assert '</ul>' not in out  # UL end tag should be replaced by OL end tag
+
 
 
 

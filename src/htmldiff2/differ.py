@@ -298,9 +298,11 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         self._stack.append(tag)
         self.append(START, (tag, attrs), pos)
 
-    def enter_mark_replaced(self, pos, tag, attrs, old_attrs):
+    def enter_mark_replaced(self, pos, tag, attrs, old_attrs, old_tag=None):
         attrs = self.inject_class(attrs, 'tagdiff_replaced')
         attrs = self.inject_refattr(attrs, old_attrs)
+        if old_tag and old_tag != tag:
+             attrs |= [(QName('data-old-tag'), qname_localname(old_tag))]
         if getattr(self.config, 'add_diff_ids', False):
             diff_id = self._active_diff_id() or self._new_diff_id()
             attrs = self._set_attr(attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
@@ -771,8 +773,15 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                             (new_t, new_attrs) = new_ev[1]
                             structural_tags = ('table', 'thead', 'tbody', 'tfoot', 'tr', 'td', 'th', 'ul', 'ol', 'li')
                             lname = qname_localname(old_t)
-                            if lname == qname_localname(new_t) and lname in structural_tags:
-                                self.enter_mark_replaced(new_ev[2], new_t, new_attrs, old_attrs)
+                            new_lname = qname_localname(new_t)
+                            
+                            # Allow same-tag replacement OR specific structural tag swaps (ul <-> ol)
+                            # This allows granular diffs inside the list (since we don't force block atomization)
+                            # while maintaining valid HTML structure by just replacing the container tag.
+                            is_allowed_swap = (lname == new_lname) or (lname in ('ul', 'ol') and new_lname in ('ul', 'ol'))
+                            
+                            if is_allowed_swap and lname in structural_tags and new_lname in structural_tags:
+                                self.enter_mark_replaced(new_ev[2], new_t, new_attrs, old_attrs, old_tag=old_t)
                                 k += 1
                                 continue
 
