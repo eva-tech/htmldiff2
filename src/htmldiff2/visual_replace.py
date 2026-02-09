@@ -187,6 +187,29 @@ def can_visual_container_replace(differ, old_events, new_events):
     if old_attrs.get('id') != new_attrs.get('id'):
         return True
 
+    # Check if any inner child has tracked attribute changes (e.g. span style change)
+    track_attrs = set(getattr(differ.config, 'track_attrs', ('style', 'class', 'src', 'href')))
+    old_inner_attrs = {}
+    new_inner_attrs = {}
+    for ev in old_events[1:-1]:
+        if ev[0] == START:
+            t, a = ev[1]
+            for attr in track_attrs:
+                v = a.get(attr)
+                if v:
+                    key = (qname_localname(t), attr)
+                    old_inner_attrs[key] = v
+    for ev in new_events[1:-1]:
+        if ev[0] == START:
+            t, a = ev[1]
+            for attr in track_attrs:
+                v = a.get(attr)
+                if v:
+                    key = (qname_localname(t), attr)
+                    new_inner_attrs[key] = v
+    if old_inner_attrs != new_inner_attrs:
+        return True
+
     return False
 
 

@@ -1388,6 +1388,25 @@ def test_trailing_space_granular_diff():
     assert '<ins>Espacio visceral' not in out, "Full text should not be in ins"
 
 
+def test_span_font_family_diff():
+    """Test that style changes on inner spans (e.g. font-family) trigger a diff.
+    
+    Issue: can_visual_container_replace only checked outer container (P) attributes.
+    When a span inside P had a style change (but P and text remained same), no diff was produced.
+    
+    Fix: Added check for inner child attribute differences in can_visual_container_replace.
+    """
+    old = '''<p dir="ltr" style="font-size: 15pt;"><span style="text-decoration: none; vertical-align: baseline;">Motivo del estudio:</span></p>'''
+    new = '''<p dir="ltr" style="font-size: 15pt;"><span style="font-family: 'Times New Roman', Times, serif; text-decoration: none; vertical-align: baseline;">Motivo del estudio:</span></p>'''
+    
+    out = htmldiff2.render_html_diff(old, new)
+    
+    assert '<del' in out, "Should show deletion for old style"
+    assert '<ins' in out, "Should show insertion for new style"
+    assert "Times New Roman" in out, "New font family should be visible in diff"
+
+
+
 
 
 
