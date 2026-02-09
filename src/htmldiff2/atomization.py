@@ -129,7 +129,9 @@ def create_block_atom_key(lname, block_events, attrs, config, visual_tags):
         # if the text is identical, while the tag change is handled later.
         # Include a 'block' marker to distinguish from raw text atoms.
         # Also strip common list markers (-, *, •) to allow "- Item" (p) to match "Item" (li).
-        normalized_text = _list_marker_re.sub('', block_text)
+        # IMPORTANT: .strip() the text so trailing/leading whitespace changes
+        # don't prevent atom matching (inner diff will handle the actual change).
+        normalized_text = _list_marker_re.sub('', block_text).strip()
         return ('block', normalized_text)
     elif lname in ('ul', 'ol'):
         # Force these containers to always be 'equal' in the outer matcher

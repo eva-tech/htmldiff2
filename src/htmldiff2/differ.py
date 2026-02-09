@@ -485,7 +485,32 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                             self.leave(new_events[-1][2], new_events[-1][1])
                             continue
                     
-                    # Attribute-only change (same structure) - use visual replace
+                    # Same structure - could be attribute-only OR text-only difference.
+                    # If raw text differs, prefer inner diff for granular marking (e.g. trailing space)
+                    old_raw = raw_text_from_events(old_events)
+                    new_raw = raw_text_from_events(new_events)
+                    
+                    if old_raw != new_raw:
+                        # Text differs - use inner diff for granular change marking
+                        if (old_events and new_events and
+                            old_events[0][0] == START and new_events[0][0] == START and
+                            old_events[-1][0] == END and new_events[-1][0] == END):
+                            
+                            (cont_tag, cont_attrs) = new_events[0][1]
+                            cont_pos = new_events[0][2]
+                            self.enter(cont_pos, cont_tag, cont_attrs)
+                            
+                            old_children = old_events[1:-1]
+                            new_children = new_events[1:-1]
+                            
+                            inner = _EventDiffer(old_children, new_children, self.config, diff_id_state=self._diff_id_state)
+                            for ev in inner.get_diff_events():
+                                self.append(*ev)
+                            
+                            self.leave(new_events[-1][2], new_events[-1][1])
+                            continue
+                    
+                    # Attribute-only change (same structure, same text) - use visual replace
                     with self.diff_group():
                         render_visual_replace_inline(self, old_events, new_events)
                     continue

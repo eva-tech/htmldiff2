@@ -1360,5 +1360,34 @@ def test_ul_to_ol_nesting_fix():
     assert '</ul>' not in out  # UL end tag should be replaced by OL end tag
 
 
+def test_trailing_space_granular_diff():
+    """Test that trailing whitespace changes produce granular diff, not full block replace.
+    
+    Issue: When a trailing space was removed from text inside a <p> block,
+    the entire paragraph was duplicated (del + ins), even though only the space changed.
+    
+    Fix: 
+    1. Added .strip() to atom key generation so trailing whitespace doesn't prevent matching.
+    2. When structure is same but text differs, use inner diff instead of visual replace.
+    """
+    old = '''<p dir="ltr" style="line-height: 1.2; text-align: justify; margin-top: 0pt; margin-bottom: 0pt;"><span style="text-decoration: none; vertical-align: baseline; white-space: pre-wrap;">Espacio visceral, </span><span style="text-decoration: none; vertical-align: baseline; white-space: pre-wrap;">las regiones supra glótica, glótica y subglótica laríngeas dentro de parámetros normales, las estructuras del esqueleto laríngeo sin alteraciones. </span></p>'''
+    
+    # Same text but trailing space removed from second span
+    new = '''<p dir="ltr" style="line-height: 1.2; margin-bottom: 0pt; margin-top: 0pt; text-align: justify;"><span style="text-decoration: none; vertical-align: baseline; white-space: pre-wrap;">Espacio visceral, </span><span style="text-decoration: none; vertical-align: baseline; white-space: pre-wrap;">las regiones supra glótica, glótica y subglótica laríngeas dentro de parámetros normales, las estructuras del esqueleto laríngeo sin alteraciones.</span></p>'''
+    
+    out = htmldiff2.render_html_diff(old, new)
+    
+    # Text should appear only ONCE (granular diff), not duplicated
+    assert out.count('esqueleto laríngeo') == 1, "Text should not be duplicated"
+    
+    # The trailing space should be marked with <del>
+    assert '<del' in out, "Trailing space should be marked as deleted"
+    
+    # The full text should NOT be wrapped in del/ins
+    assert '<del>Espacio visceral' not in out, "Full text should not be in del"
+    assert '<ins>Espacio visceral' not in out, "Full text should not be in ins"
+
+
+
 
 
