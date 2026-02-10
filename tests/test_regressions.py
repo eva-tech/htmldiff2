@@ -641,8 +641,10 @@ def test_bullets_paragraph_to_list_conversion_is_grouped_and_structural():
     # Structural markers should exist (frontend removes/keeps whole nodes).
     assert "tagdiff_added" in out
     assert "<ul" in out and "<li" in out
-    # Insert markers should be present inside the added items.
-    assert "<ins" in out
+    # Bullet-only diff markers should be present on the LI items.
+    assert "diff-bullet-ins" in out
+    # Old content should be hidden in structural-revert-data for accept/reject.
+    assert "structural-revert-data" in out
 
 
 def test_ul_style_change_is_replaced_not_nested():
@@ -684,9 +686,9 @@ def test_ul_style_change_is_replaced_not_nested():
 
 def test_paragraphs_converted_to_list_wrapped_correctly():
     """
-    Test that when converting <p> blocks to a <ul> list, the deleted <p> elements
-    are wrapped in synthetic <li> tags inside the <ul>, rather than being
-    direct children of <ul> (which is invalid HTML).
+    Test that when converting <p> blocks to a <ul> list with identical text,
+    the structural list diff emits bullet-only classes (diff-bullet-ins)
+    and hides old content in structural-revert-data.
     """
     old = """
     <p>Item 1</p>
@@ -700,22 +702,11 @@ def test_paragraphs_converted_to_list_wrapped_correctly():
     """
     out = htmldiff2.render_html_diff(old, new)
     
-    # We expect <ul ...> ... <li class="tagdiff_deleted"><del><p>Item 1</p></del></li> ... </ul>
-    # Or similar, but NOT <ul ...> <del> ... </del> </ul>
-    
-    # Check that <del> is NOT a direct child of <ul> (approximate check)
-    # The output might contain data-diff-id, so we use regex or robust checks.
-    # We look for LI with tagdiff_deleted/added containing a DEL/INS
-    import re
-    
-    # Matches <li...><del... or <li...><ins...
-    # We allow standard <li> wrapper (from visual replace) OR tagdiff <li> wrapper (block replace)
-    li_del_pattern = r'<li[^>]*>\s*<(del|ins)'
-    assert re.search(li_del_pattern, out), f"Did not find wrapped list item in output: {out}"
-    
-    # Verify we don't have the invalid structure
-    # This regex looks for <ul ...> then immediate <del
-    assert not re.search(r'<ul[^>]*>\s*<del', out), "Found <del> directly inside <ul>"
+    # Should use structural list diff: bullet-only classes on LIs
+    assert 'diff-bullet-ins' in out, f"Expected diff-bullet-ins in output: {out}"
+    assert 'tagdiff_added' in out, f"Expected tagdiff_added on ul: {out}"
+    # Old content hidden for accept/reject
+    assert 'structural-revert-data' in out, f"Expected structural-revert-data: {out}"
     
     # Verify content is preserved
     assert "Item 1" in out and "Item 2" in out
@@ -1455,3 +1446,66 @@ def test_ol_style_change_medical_report():
     assert 'tagdiff_replaced' not in out
     assert 'tagdiff_added' not in out
     assert 'tagdiff_deleted' not in out
+
+
+def test_structural_list_diff_text_to_list():
+    """
+    When <p> blocks are converted to <ol><li> with identical text,
+    emit bullet-only classes (diff-bullet-ins) and hidden revert data.
+    """
+    old = '<p>Item A.</p>\n<p>Item B.</p>'
+    new = '<ol>\n<li><p>Item A.</p></li>\n<li><p>Item B.</p></li>\n</ol>'
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    assert 'diff-bullet-ins' in out
+    assert 'tagdiff_added' in out
+    assert 'structural-revert-data' in out
+    assert 'display:none' in out
+    # Text should NOT be in <ins> tags (bullet-only change)
+    assert '<ins' not in out or 'structural-revert-data' in out
+    assert 'Item A.' in out and 'Item B.' in out
+
+
+def test_structural_list_diff_list_to_text():
+    """
+    Reverse: when <ol><li> is converted back to <p> blocks with identical text,
+    emit bullet-only classes (diff-bullet-del) and hidden revert data.
+    """
+    old = '<ol>\n<li><p>Item A.</p></li>\n<li><p>Item B.</p></li>\n</ol>'
+    new = '<p>Item A.</p>\n<p>Item B.</p>'
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    assert 'diff-bullet-del' in out
+    assert 'tagdiff_deleted' in out
+    assert 'structural-revert-data' in out
+    assert 'display:none' in out
+    assert 'Item A.' in out and 'Item B.' in out
+
+
+def test_structural_list_diff_medical_report_bullets():
+    """
+    User scenario: LLM converts plain text medical findings to a bullet list.
+    Text content is identical, only structure changes.
+    """
+    old = """<h3>Hallazgos:</h3>
+<p>El corazón tiene tamaño y morfología normal.</p>
+<p>El mediastino es de configuración normal.</p>"""
+    new = """<h3>Hallazgos:</h3>
+<ol>
+<li><p>El corazón tiene tamaño y morfología normal.</p></li>
+<li><p>El mediastino es de configuración normal.</p></li>
+</ol>"""
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    assert 'diff-bullet-ins' in out, f"Expected diff-bullet-ins: {out}"
+    assert 'tagdiff_added' in out, f"Expected tagdiff_added: {out}"
+    assert 'structural-revert-data' in out, f"Expected structural-revert-data: {out}"
+    # The heading should be unchanged
+    assert '<h3>Hallazgos:</h3>' in out or 'Hallazgos:' in out
+

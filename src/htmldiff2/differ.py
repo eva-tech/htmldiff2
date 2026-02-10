@@ -751,6 +751,244 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         while k < len(opcodes):
             tag, i1, i2, j1, j2 = opcodes[k]
 
+            # ── Structural list diff: text ↔ list with identical content ──
+            # Detects pattern: insert(ol/ul START...) → equal(p↔li)... → insert(...ol/ul END)
+            # or the reverse: delete(ol/ul START...) → equal(li↔p)... → delete(...ol/ul END)
+            # When detected, emits bullet-only classes instead of full text del/ins.
+            if tag == 'insert':
+                # Scan insert range for an ol/ul START event atom
+                list_start_ev = None
+                list_tag = None
+                for nj in range(j1, j2):
+                    a = self._new_atoms[nj]
+                    evs = a.get('events', [])
+                    if len(evs) == 1 and evs[0][0] == START:
+                        lname = qname_localname(evs[0][1][0])
+                        if lname in ('ol', 'ul'):
+                            list_start_ev = evs[0]
+                            list_tag = lname
+                            break
+
+                if list_tag:
+                    # Look ahead: find equal(p↔li) blocks followed by insert(...END ol/ul)
+                    bullet_equal_ranges = []
+                    scan_k = k + 1
+                    found_structural = False
+                    while scan_k < len(opcodes):
+                        s_tag, s_i1, s_i2, s_j1, s_j2 = opcodes[scan_k]
+                        if s_tag == 'equal':
+                            # Check old=p blocks, new=li blocks (skip whitespace text atoms)
+                            all_p_to_li = True
+                            has_block = False
+                            for ai in range(s_i1, s_i2):
+                                old_a = self._old_atoms[ai]
+                                if old_a.get('kind') == 'text':
+                                    continue
+                                if old_a.get('kind') == 'block' and old_a.get('tag') == 'p':
+                                    has_block = True
+                                    continue
+                                all_p_to_li = False
+                                break
+                            if all_p_to_li:
+                                for nj in range(s_j1, s_j2):
+                                    new_a = self._new_atoms[nj]
+                                    if new_a.get('kind') == 'text':
+                                        continue
+                                    if new_a.get('kind') == 'block' and new_a.get('tag') == 'li':
+                                        has_block = True
+                                        continue
+                                    all_p_to_li = False
+                                    break
+                            if all_p_to_li and has_block:
+                                bullet_equal_ranges.append((scan_k, s_tag, s_i1, s_i2, s_j1, s_j2))
+                                scan_k += 1
+                                continue
+                        elif s_tag == 'insert':
+                            # Scan for END ol/ul in the insert range
+                            end_ev = None
+                            for nj in range(s_j1, s_j2):
+                                a = self._new_atoms[nj]
+                                evs = a.get('events', [])
+                                if len(evs) == 1 and evs[0][0] == END:
+                                    if qname_localname(evs[0][1]) == list_tag:
+                                        end_ev = evs[0]
+                                        break
+                            if end_ev and bullet_equal_ranges:
+                                # Found complete pattern! Emit structural list diff.
+                                old_p_atoms = []
+                                new_li_atoms = []
+                                for _, _, eq_i1, eq_i2, eq_j1, eq_j2 in bullet_equal_ranges:
+                                    for ai in range(eq_i1, eq_i2):
+                                        if self._old_atoms[ai].get('kind') == 'block':
+                                            old_p_atoms.append(self._old_atoms[ai])
+                                    for nj in range(eq_j1, eq_j2):
+                                        if self._new_atoms[nj].get('kind') == 'block':
+                                            new_li_atoms.append(self._new_atoms[nj])
+
+                                if old_p_atoms and new_li_atoms:
+                                    with self.diff_group():
+                                        diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
+
+                                        # Emit hidden <del class="structural-revert-data"> with old <p> events
+                                        revert_events = concat_events(old_p_atoms)
+                                        del_attrs = Attrs([(QName('class'), 'structural-revert-data'),
+                                                           (QName('style'), 'display:none')])
+                                        if diff_id:
+                                            del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+                                        self.append(START, (QName('del'), del_attrs), (None, -1, -1))
+                                        for ev in revert_events:
+                                            self.append(*ev)
+                                        self.append(END, QName('del'), (None, -1, -1))
+
+                                        # Emit <ol/ul class="tagdiff_added">
+                                        list_qname = list_start_ev[1][0]
+                                        list_attrs = list_start_ev[1][1]
+                                        list_attrs = self.inject_class(list_attrs, 'tagdiff_added')
+                                        if diff_id:
+                                            list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                        self.enter(list_start_ev[2], list_qname, list_attrs)
+
+                                        # Emit each <li class="diff-bullet-ins">
+                                        for li_atom in new_li_atoms:
+                                            li_evs = li_atom.get('events', [])
+                                            if li_evs and li_evs[0][0] == START:
+                                                li_tag = li_evs[0][1][0]
+                                                li_attrs = li_evs[0][1][1]
+                                                li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
+                                                if diff_id:
+                                                    li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                                self.enter(li_evs[0][2], li_tag, li_attrs)
+                                                for ev in li_evs[1:-1]:
+                                                    self.append(*ev)
+                                                self.leave(li_evs[-1][2], li_evs[-1][1])
+
+                                        # Close ol/ul
+                                        self.leave(end_ev[2], end_ev[1])
+
+                                    k = scan_k + 1
+                                    found_structural = True
+                                    break
+                            break
+                        else:
+                            break
+                    if found_structural:
+                        continue
+
+            # Handle reverse: delete(ol/ul START...) → equal(li↔p)... → delete(...ol/ul END)
+            if tag == 'delete':
+                list_start_ev = None
+                list_tag = None
+                for ai in range(i1, i2):
+                    a = self._old_atoms[ai]
+                    evs = a.get('events', [])
+                    if len(evs) == 1 and evs[0][0] == START:
+                        lname = qname_localname(evs[0][1][0])
+                        if lname in ('ol', 'ul'):
+                            list_start_ev = evs[0]
+                            list_tag = lname
+                            break
+
+                if list_tag:
+                    bullet_equal_ranges = []
+                    scan_k = k + 1
+                    found_structural = False
+                    while scan_k < len(opcodes):
+                        s_tag, s_i1, s_i2, s_j1, s_j2 = opcodes[scan_k]
+                        if s_tag == 'equal':
+                            all_li_to_p = True
+                            has_block = False
+                            for ai in range(s_i1, s_i2):
+                                old_a = self._old_atoms[ai]
+                                if old_a.get('kind') == 'text':
+                                    continue
+                                if old_a.get('kind') == 'block' and old_a.get('tag') == 'li':
+                                    has_block = True
+                                    continue
+                                all_li_to_p = False
+                                break
+                            if all_li_to_p:
+                                for nj in range(s_j1, s_j2):
+                                    new_a = self._new_atoms[nj]
+                                    if new_a.get('kind') == 'text':
+                                        continue
+                                    if new_a.get('kind') == 'block' and new_a.get('tag') == 'p':
+                                        has_block = True
+                                        continue
+                                    all_li_to_p = False
+                                    break
+                            if all_li_to_p and has_block:
+                                bullet_equal_ranges.append((scan_k, s_tag, s_i1, s_i2, s_j1, s_j2))
+                                scan_k += 1
+                                continue
+                        elif s_tag == 'delete':
+                            end_ev = None
+                            for ai in range(s_i1, s_i2):
+                                a = self._old_atoms[ai]
+                                evs = a.get('events', [])
+                                if len(evs) == 1 and evs[0][0] == END:
+                                    if qname_localname(evs[0][1]) == list_tag:
+                                        end_ev = evs[0]
+                                        break
+                            if end_ev and bullet_equal_ranges:
+                                old_li_atoms = []
+                                new_p_atoms = []
+                                for _, _, eq_i1, eq_i2, eq_j1, eq_j2 in bullet_equal_ranges:
+                                    for ai in range(eq_i1, eq_i2):
+                                        if self._old_atoms[ai].get('kind') == 'block':
+                                            old_li_atoms.append(self._old_atoms[ai])
+                                    for nj in range(eq_j1, eq_j2):
+                                        if self._new_atoms[nj].get('kind') == 'block':
+                                            new_p_atoms.append(self._new_atoms[nj])
+
+                                if old_li_atoms and new_p_atoms:
+                                    with self.diff_group():
+                                        diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
+
+                                        # Emit <ol/ul class="tagdiff_deleted">
+                                        list_qname = list_start_ev[1][0]
+                                        list_attrs = list_start_ev[1][1]
+                                        list_attrs = self.inject_class(list_attrs, 'tagdiff_deleted')
+                                        if diff_id:
+                                            list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                        self.enter(list_start_ev[2], list_qname, list_attrs)
+
+                                        # Emit each <li class="diff-bullet-del">
+                                        for li_atom in old_li_atoms:
+                                            li_evs = li_atom.get('events', [])
+                                            if li_evs and li_evs[0][0] == START:
+                                                li_tag = li_evs[0][1][0]
+                                                li_attrs = li_evs[0][1][1]
+                                                li_attrs = self.inject_class(li_attrs, 'diff-bullet-del')
+                                                if diff_id:
+                                                    li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                                self.enter(li_evs[0][2], li_tag, li_attrs)
+                                                for ev in li_evs[1:-1]:
+                                                    self.append(*ev)
+                                                self.leave(li_evs[-1][2], li_evs[-1][1])
+
+                                        # Close ol/ul
+                                        self.leave(end_ev[2], end_ev[1])
+
+                                        # Emit hidden <ins class="structural-revert-data"> with new <p> events
+                                        revert_events = concat_events(new_p_atoms)
+                                        ins_attrs = Attrs([(QName('class'), 'structural-revert-data'),
+                                                           (QName('style'), 'display:none')])
+                                        if diff_id:
+                                            ins_attrs = ins_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+                                        self.append(START, (QName('ins'), ins_attrs), (None, -1, -1))
+                                        for ev in revert_events:
+                                            self.append(*ev)
+                                        self.append(END, QName('ins'), (None, -1, -1))
+
+                                    k = scan_k + 1
+                                    found_structural = True
+                                    break
+                            break
+                        else:
+                            break
+                    if found_structural:
+                        continue
+
             # Pair structural list conversions even when SequenceMatcher emits delete+insert
             # as separate opcodes (not the same anchor => not normalized into replace).
             if tag in ("delete", "insert") and k + 1 < len(opcodes):
