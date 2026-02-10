@@ -648,7 +648,7 @@ def test_bullets_paragraph_to_list_conversion_is_grouped_and_structural():
 def test_ul_style_change_is_replaced_not_nested():
     """
     Test that changing style/attributes on a structural tag (like UL)
-    results in a single tag with 'tagdiff_replaced' class,
+    results in a single list with inline del/ins per LI,
     NOT a deleted UL containing an added UL (nested structure).
     """
     old = """
@@ -669,18 +669,17 @@ def test_ul_style_change_is_replaced_not_nested():
 """
     out = htmldiff2.render_html_diff(old.strip(), new.strip())
 
-    # Should use tagdiff_replaced
-    assert 'class="tagdiff_replaced"' in out
+    # Should use inline del/ins per LI (not tagdiff_replaced or nested ul)
+    assert '<del' in out, "Should have del tags for old content"
+    assert '<ins' in out, "Should have ins tags for new content"
     
-    # Should NOT satisfy the nested deleted/added pattern
-    # Checks for <ul ... class="tagdiff_deleted"><ul ... class="tagdiff_added"> which was the bug
-    assert not ('tagdiff_deleted' in out and 'tagdiff_added' in out)
+    # Should NOT have nested deleted/added UL pattern
+    assert 'tagdiff_deleted' not in out
+    assert 'tagdiff_added' not in out
     
-    # Verify the UL has the class
-    assert '<ul' in out
-    # Simple check that we don't have multiple UL openings if we expect one
-    # (Though in a real diff we might have others, here inputs are small)
-    assert out.count('<ul') == 1
+    # Should be a SINGLE UL with the new style
+    assert out.count('<ul') == 1, "Should have exactly one UL"
+    assert 'font-size: 12pt' in out, "New style should be present"
 
 
 def test_paragraphs_converted_to_list_wrapped_correctly():
@@ -1410,3 +1409,49 @@ def test_span_font_family_diff():
 
 
 
+
+def test_ol_style_change_medical_report():
+    """Test user provided case: Medical report OL with style change.
+    Should produce single <ol> with inline del/ins per item.
+    """
+    old = '''<div><div><div><div><div>  <br/>
+<h2 style="font-size: 20pt;"><strong>TC DE TÓRAX (CON CONTRASTE)</strong></h2>
+<br/>
+<p style="font-size: 20pt;"><strong>HALLAZGOS:</strong></p>
+<ol>
+<li><strong>Pulmones:</strong> Los pulmones están bien expandidos.</li>
+<li><strong>Vías Aéreas:</strong> La tráquea y los bronquios principales están libres.</li>
+<li><strong>Pleura:</strong> No se observa derrame pleural ni engrosamiento pleural.</li>
+</ol>
+<br/>
+<p style="font-size: 20pt;"><strong>IMPRESIÓN:</strong></p>
+<p style="font-size: 20pt;">TC de tórax sin hallazgos patológicos agudos o significativos.</p>
+</div></div></div></div></div>'''
+
+    new = '''<div><div><div><div><div>  <br/>
+<h2 style="font-size: 20pt;"><strong>TC DE TÓRAX (CON CONTRASTE)</strong></h2>
+<br/>
+<p style="font-size: 20pt;"><strong>HALLAZGOS:</strong></p>
+<ol style="font-size: 20pt;">
+<li><strong>Pulmones:</strong> Los pulmones están bien expandidos.</li>
+<li><strong>Vías Aéreas:</strong> La tráquea y los bronquios principales están libres.</li>
+<li><strong>Pleura:</strong> No se observa derrame pleural ni engrosamiento pleural.</li>
+</ol>
+<br/>
+<p style="font-size: 20pt;"><strong>IMPRESIÓN:</strong></p>
+<p style="font-size: 20pt;">TC de tórax sin hallazgos patológicos agudos o significativos.</p>
+</div></div></div></div></div>'''
+
+    out = htmldiff2.render_html_diff(old, new)
+
+    # Should have single OL with new style
+    assert out.count('<ol') == 1
+    assert 'style="font-size: 20pt;"' in out
+    
+    # Should have inline del/ins
+    assert '<del' in out and '<ins' in out
+    
+    # Should NOT have tagdiff classes
+    assert 'tagdiff_replaced' not in out
+    assert 'tagdiff_added' not in out
+    assert 'tagdiff_deleted' not in out
