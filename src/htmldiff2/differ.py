@@ -752,10 +752,11 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
             tag, i1, i2, j1, j2 = opcodes[k]
 
             # ── Structural list diff: text ↔ list with identical content ──
-            # Detects pattern: insert(ol/ul START...) → equal(p↔li)... → insert(...ol/ul END)
-            # or the reverse: delete(ol/ul START...) → equal(li↔p)... → delete(...ol/ul END)
+            # Detects pattern: insert/replace(ol/ul START...) → equal(p↔li)... → insert/replace(...ol/ul END)
+            # or the reverse: delete/replace(ol/ul START...) → equal(li↔p)... → delete/replace(...ol/ul END)
             # When detected, emits bullet-only classes instead of full text del/ins.
-            if tag == 'insert':
+            # Also handles 'replace' where e.g. <p> </p> is replaced by ul START.
+            if tag in ('insert', 'replace'):
                 # Scan insert range for an ol/ul START event atom
                 list_start_ev = None
                 list_tag = None
@@ -803,7 +804,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                 bullet_equal_ranges.append((scan_k, s_tag, s_i1, s_i2, s_j1, s_j2))
                                 scan_k += 1
                                 continue
-                        elif s_tag == 'insert':
+                            else:
+                                break
+                        elif s_tag in ('insert', 'replace'):
                             # Scan for END ol/ul in the insert range
                             end_ev = None
                             for nj in range(s_j1, s_j2):
@@ -817,6 +820,11 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                 # Found complete pattern! Emit structural list diff.
                                 old_p_atoms = []
                                 new_li_atoms = []
+                                # Collect old atoms from the initial replace (e.g. deleted <p> </p>)
+                                if tag == 'replace':
+                                    for ai in range(i1, i2):
+                                        if self._old_atoms[ai].get('kind') == 'block':
+                                            old_p_atoms.append(self._old_atoms[ai])
                                 for _, _, eq_i1, eq_i2, eq_j1, eq_j2 in bullet_equal_ranges:
                                     for ai in range(eq_i1, eq_i2):
                                         if self._old_atoms[ai].get('kind') == 'block':
@@ -824,6 +832,11 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                     for nj in range(eq_j1, eq_j2):
                                         if self._new_atoms[nj].get('kind') == 'block':
                                             new_li_atoms.append(self._new_atoms[nj])
+                                # Collect old atoms from the end replace too
+                                if s_tag == 'replace':
+                                    for ai in range(s_i1, s_i2):
+                                        if self._old_atoms[ai].get('kind') == 'block':
+                                            old_p_atoms.append(self._old_atoms[ai])
 
                                 if old_p_atoms and new_li_atoms:
                                     with self.diff_group():
@@ -874,10 +887,12 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                     if found_structural:
                         continue
 
-            # Handle reverse: delete(ol/ul START...) → equal(li↔p)... → delete(...ol/ul END)
-            if tag == 'delete':
+            # Handle reverse: delete/replace(ol/ul START...) → equal(li↔p)... → delete/replace(...ol/ul END)
+            # Use elif when tag is 'replace' to avoid double-processing
+            if tag == 'delete' or (tag == 'replace' and not list_tag):
                 list_start_ev = None
                 list_tag = None
+                # For delete: scan old atoms; for replace: also scan old atoms
                 for ai in range(i1, i2):
                     a = self._old_atoms[ai]
                     evs = a.get('events', [])
@@ -920,7 +935,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                 bullet_equal_ranges.append((scan_k, s_tag, s_i1, s_i2, s_j1, s_j2))
                                 scan_k += 1
                                 continue
-                        elif s_tag == 'delete':
+                            else:
+                                break
+                        elif s_tag in ('delete', 'replace'):
                             end_ev = None
                             for ai in range(s_i1, s_i2):
                                 a = self._old_atoms[ai]
@@ -932,11 +949,21 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                             if end_ev and bullet_equal_ranges:
                                 old_li_atoms = []
                                 new_p_atoms = []
+                                # Collect new atoms from the initial replace (e.g. new <p> replacing ul START)
+                                if tag == 'replace':
+                                    for nj in range(j1, j2):
+                                        if self._new_atoms[nj].get('kind') == 'block':
+                                            new_p_atoms.append(self._new_atoms[nj])
                                 for _, _, eq_i1, eq_i2, eq_j1, eq_j2 in bullet_equal_ranges:
                                     for ai in range(eq_i1, eq_i2):
                                         if self._old_atoms[ai].get('kind') == 'block':
                                             old_li_atoms.append(self._old_atoms[ai])
                                     for nj in range(eq_j1, eq_j2):
+                                        if self._new_atoms[nj].get('kind') == 'block':
+                                            new_p_atoms.append(self._new_atoms[nj])
+                                # Collect new atoms from the end replace too
+                                if s_tag == 'replace':
+                                    for nj in range(s_j1, s_j2):
                                         if self._new_atoms[nj].get('kind') == 'block':
                                             new_p_atoms.append(self._new_atoms[nj])
 
