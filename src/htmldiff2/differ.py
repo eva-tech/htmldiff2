@@ -1071,11 +1071,12 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                             is_allowed_swap = (lname == new_lname) or (lname in ('ul', 'ol') and new_lname in ('ul', 'ol'))
                             
                             if is_allowed_swap and lname in structural_tags and new_lname in structural_tags:
-                                if lname == new_lname and old_attrs != new_attrs and lname in ('ul', 'ol'):
-                                    # OL/UL attr-only change: emit a SINGLE list with inline del/ins per LI.
-                                    # Find the corresponding END atom for both old and new.
+                                if lname in ('ul', 'ol') and new_lname in ('ul', 'ol'):
+                                    # List type/style change (ol↔ul swap or same-tag attr change)
+                                    # Use structural diff: diff-bullet-ins + structural-revert-data
                                     end_idx_old = None
                                     end_idx_new = None
+                                    # Find END atom for old list (search for old tag name)
                                     depth = 1
                                     for oi in range(i1 + 1, len(self._old_atoms)):
                                         for ev in self._old_atoms[oi].get('events', []):
@@ -1087,12 +1088,13 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                                     end_idx_old = oi
                                         if end_idx_old is not None:
                                             break
+                                    # Find END atom for new list (use new_lname for ul↔ol case)
                                     depth = 1
                                     for ni in range(j1 + 1, len(self._new_atoms)):
                                         for ev in self._new_atoms[ni].get('events', []):
-                                            if ev[0] == START and qname_localname(ev[1][0]) == lname:
+                                            if ev[0] == START and qname_localname(ev[1][0]) == new_lname:
                                                 depth += 1
-                                            elif ev[0] == END and qname_localname(ev[1]) == lname:
+                                            elif ev[0] == END and qname_localname(ev[1]) == new_lname:
                                                 depth -= 1
                                                 if depth == 0:
                                                     end_idx_new = ni
@@ -1100,73 +1102,66 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                             break
 
                                     if end_idx_old is not None and end_idx_new is not None:
-                                        # Emit NEW OL/UL container (with new attrs)
-                                        self.enter(new_ev[2], new_t, new_attrs)
+                                        # Collect old list atoms (full list) for revert data
+                                        old_list_atoms = self._old_atoms[i1:end_idx_old + 1]
+                                        # Collect new LI atoms for bullet display
+                                        new_li_atoms = [a for a in self._new_atoms[j1 + 1:end_idx_new]
+                                                        if a.get('tag') == 'li']
 
-                                        # Collect LI block atoms from old and new ranges
-                                        old_li_atoms = [a for a in self._old_atoms[i1+1:end_idx_old] if a.get('tag') == 'li']
-                                        new_li_atoms = [a for a in self._new_atoms[j1+1:end_idx_new] if a.get('tag') == 'li']
+                                        if new_li_atoms:
+                                            with self.diff_group():
+                                                diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
 
-                                        # Pair LIs by position and emit inline del/ins per item
-                                        max_li = max(len(old_li_atoms), len(new_li_atoms))
-                                        for li_idx in range(max_li):
-                                            old_li = old_li_atoms[li_idx] if li_idx < len(old_li_atoms) else None
-                                            new_li = new_li_atoms[li_idx] if li_idx < len(new_li_atoms) else None
+                                                # Emit hidden <del class="structural-revert-data"> with old list
+                                                revert_events = concat_events(old_list_atoms)
+                                                del_attrs = Attrs([(QName('class'), 'structural-revert-data'),
+                                                                   (QName('style'), 'display:none')])
+                                                if diff_id:
+                                                    del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+                                                self.append(START, (QName('del'), del_attrs), (None, -1, -1))
+                                                for ev in revert_events:
+                                                    self.append(*ev)
+                                                self.append(END, QName('del'), (None, -1, -1))
 
-                                            if old_li and new_li:
-                                                # Both exist: emit <li><del>old_children</del><ins>new_children</ins></li>
-                                                old_li_evs = old_li.get('events', [])
-                                                new_li_evs = new_li.get('events', [])
+                                                # Emit new list with tagdiff_added
+                                                list_qname = new_ev[1][0]
+                                                list_attrs_new = new_ev[1][1]
+                                                list_attrs_new = self.inject_class(list_attrs_new, 'tagdiff_added')
+                                                if diff_id:
+                                                    list_attrs_new = self._set_attr(list_attrs_new, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                                self.enter(new_ev[2], list_qname, list_attrs_new)
 
-                                                # Use new LI's tag and attrs for the container
-                                                li_tag = new_li_evs[0][1][0]
-                                                li_attrs = new_li_evs[0][1][1]
-                                                li_pos = new_li_evs[0][2]
-                                                self.enter(li_pos, li_tag, li_attrs)
+                                                # Emit each LI with diff-bullet-ins
+                                                for li_atom in new_li_atoms:
+                                                    li_evs = li_atom.get('events', [])
+                                                    if li_evs and li_evs[0][0] == START:
+                                                        li_tag = li_evs[0][1][0]
+                                                        li_attrs = li_evs[0][1][1]
+                                                        li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
+                                                        if diff_id:
+                                                            li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                                        self.enter(li_evs[0][2], li_tag, li_attrs)
+                                                        for ev in li_evs[1:-1]:
+                                                            self.append(*ev)
+                                                        self.leave(li_evs[-1][2], li_evs[-1][1])
 
-                                                # Old LI children in <del>
-                                                old_children = old_li_evs[1:-1]
-                                                new_children = new_li_evs[1:-1]
+                                                # Close list
+                                                end_ev_atoms = self._new_atoms[end_idx_new].get('events', [])
+                                                if end_ev_atoms:
+                                                    self.leave(end_ev_atoms[0][2], end_ev_atoms[0][1])
 
-                                                with self.diff_group():
-                                                    with self.context('del'):
-                                                        self.block_process(old_children)
-                                                    with self.context('ins'):
-                                                        self.block_process(new_children)
+                                            # Skip all consumed opcodes
+                                            while k + 1 < len(opcodes):
+                                                next_tag, next_i1, next_i2, next_j1, next_j2 = opcodes[k + 1]
+                                                if next_i1 <= end_idx_old or next_j1 <= end_idx_new:
+                                                    k += 1
+                                                else:
+                                                    break
+                                            k += 1
+                                            continue
 
-                                                self.leave(new_li_evs[-1][2], new_li_evs[-1][1])
-                                            elif old_li:
-                                                # Only old: deleted LI
-                                                with self.diff_group():
-                                                    with self.context('del'):
-                                                        self.block_process(old_li.get('events', []))
-                                            elif new_li:
-                                                # Only new: inserted LI
-                                                with self.diff_group():
-                                                    with self.context('ins'):
-                                                        self.block_process(new_li.get('events', []))
-
-                                        # Close OL/UL
-                                        end_ev = self._new_atoms[end_idx_new].get('events', [])
-                                        if end_ev:
-                                            self.leave(end_ev[0][2], end_ev[0][1])
-
-                                        # Skip all opcodes consumed by this block
-                                        while k + 1 < len(opcodes):
-                                            next_tag, next_i1, next_i2, next_j1, next_j2 = opcodes[k + 1]
-                                            if next_i1 <= end_idx_old or next_j1 <= end_idx_new:
-                                                k += 1
-                                            else:
-                                                break
-                                        k += 1
-                                        continue
                                 elif lname == new_lname and old_attrs != new_attrs:
                                     # Other structural tags (table, tr, etc) - use tagdiff_replaced
-                                    self.enter_mark_replaced(new_ev[2], new_t, new_attrs, old_attrs, old_tag=old_t)
-                                    k += 1
-                                    continue
-                                else:
-                                    # Different tags (ul <-> ol) - use replaced marker with old-tag info
                                     self.enter_mark_replaced(new_ev[2], new_t, new_attrs, old_attrs, old_tag=old_t)
                                     k += 1
                                     continue

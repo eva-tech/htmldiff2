@@ -650,7 +650,7 @@ def test_bullets_paragraph_to_list_conversion_is_grouped_and_structural():
 def test_ul_style_change_is_replaced_not_nested():
     """
     Test that changing style/attributes on a structural tag (like UL)
-    results in a single list with inline del/ins per LI,
+    results in structural diff with diff-bullet-ins + structural-revert-data,
     NOT a deleted UL containing an added UL (nested structure).
     """
     old = """
@@ -671,16 +671,16 @@ def test_ul_style_change_is_replaced_not_nested():
 """
     out = htmldiff2.render_html_diff(old.strip(), new.strip())
 
-    # Should use inline del/ins per LI (not tagdiff_replaced or nested ul)
-    assert '<del' in out, "Should have del tags for old content"
-    assert '<ins' in out, "Should have ins tags for new content"
+    # Should use structural diff pattern
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins class on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
     
-    # Should NOT have nested deleted/added UL pattern
+    # Should NOT have tagdiff_replaced (old behavior)
+    assert 'tagdiff_replaced' not in out
     assert 'tagdiff_deleted' not in out
-    assert 'tagdiff_added' not in out
     
-    # Should be a SINGLE UL with the new style
-    assert out.count('<ul') == 1, "Should have exactly one UL"
+    # New style should be present on the visible list
     assert 'font-size: 12pt' in out, "New style should be present"
 
 
@@ -1205,11 +1205,10 @@ def test_table_cell_text_change_no_extra_column():
 
 
 def test_li_style_change_shows_del_ins():
-    """LI style changes should show visible del/ins, not just tagdiff_replaced class.
+    """List type+style changes (ul->ol with LI style added) should use structural diff.
     
-    When an LI gets a style attribute added (e.g., font-size: 20pt), the diff
-    should show <del>/<ins> markers so the frontend can display the change
-    visually without needing special CSS for tagdiff_replaced.
+    When the list type changes AND LIs get style attributes, the diff
+    should use diff-bullet-ins + structural-revert-data pattern.
     """
     old = """
 <ul>
@@ -1227,19 +1226,20 @@ def test_li_style_change_shows_del_ins():
     cfg.add_diff_ids = True
     out = htmldiff2.render_html_diff(old, new, config=cfg)
     
-    # Should have del/ins markers (not just tagdiff_replaced class)
-    assert '<del' in out and '<ins' in out, "Should have visible del/ins markers"
+    # Should use structural diff pattern
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins class on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
     
-    # Should NOT rely solely on tagdiff_replaced
+    # Should NOT use tagdiff_replaced
+    assert 'tagdiff_replaced' not in out
+    
+    # LIs should be present with text
     import re
     li_tags = re.findall(r'<li[^>]*>', out)
     assert len(li_tags) >= 2, "Should have LI elements preserved"
-    
-    # Each LI should contain del and ins (visible markers inside)
-    for i, li_match in enumerate(re.finditer(r'<li[^>]*>(.*?)</li>', out, re.DOTALL)):
-        li_content = li_match.group(1)
-        assert '<del' in li_content or '<ins' in li_content, \
-            f"LI {i+1} should have del/ins inside, got: {li_content[:100]}..."
+    assert 'Tejidos blandos' in out
+    assert 'Estructuras' in out
 
 def test_capitalization_change_detected():
     """Test that capitalization changes (Cad -> CAD) are detected and marked.
@@ -1330,24 +1330,21 @@ def test_ul_to_ol_nesting_fix():
     out = htmldiff2.render_html_diff(old, new)
     
     # Updated Behavior:
-    # Instead of full block replacement (del UL + ins OL), we now support "Granular Tag Replacement".
-    # Since only the container tag name changed (ul -> ol) and structure is preserved,
-    # we emit a single OL tag marked as 'tagdiff_replaced' with 'data-old-tag="ul"'.
-    # The content inside remains UNMARKED (equal), avoiding diff noise.
+    # List type change (ul -> ol) uses structural diff:
+    # - Old list hidden in structural-revert-data
+    # - New list with tagdiff_added + diff-bullet-ins per LI
     
-    # Check for tagdiff_replaced on OL
-    assert 'tagdiff_replaced' in out
-    assert 'data-old-tag="ul"' in out
+    # Check for structural diff pattern
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
     
-    # Content should NOT be duplicated now (it is shared/equal)
-    # The items should appear exactly once (or as many times as in input) without del/ins
-    assert out.count('Item 1') == 1, "Content should be present once (shared)"
-    assert '<del>Item 1</del>' not in out
-    assert '<ins>Item 1</ins>' not in out
+    # Should NOT use tagdiff_replaced (old behavior)
+    assert 'tagdiff_replaced' not in out
     
-    # Check valid structure (closed OL)
-    assert '</ol>' in out
-    assert '</ul>' not in out  # UL end tag should be replaced by OL end tag
+    # Text should be present
+    assert 'Item 1' in out
+    assert 'Item 2' in out
 
 
 def test_trailing_space_granular_diff():
@@ -1435,16 +1432,16 @@ def test_ol_style_change_medical_report():
 
     out = htmldiff2.render_html_diff(old, new)
 
-    # Should have single OL with new style
-    assert out.count('<ol') == 1
+    # Should use structural diff pattern
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins class on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
+    
+    # New style should be present on visible list
     assert 'style="font-size: 20pt;"' in out
     
-    # Should have inline del/ins
-    assert '<del' in out and '<ins' in out
-    
-    # Should NOT have tagdiff classes
+    # Should NOT use tagdiff_replaced (old behavior)
     assert 'tagdiff_replaced' not in out
-    assert 'tagdiff_added' not in out
     assert 'tagdiff_deleted' not in out
 
 
@@ -1509,3 +1506,147 @@ def test_structural_list_diff_medical_report_bullets():
     # The heading should be unchanged
     assert '<h3>Hallazgos:</h3>' in out or 'Hallazgos:' in out
 
+
+def test_ol_to_ul_structural_diff():
+    """When ol changes to ul (numbered→bullets), use structural diff pattern.
+
+    Real-world case: LLM changes numbered list to bulleted list in a medical
+    report while keeping the same text content.
+    """
+    old = """<p><span>Hallazgos:</span></p>
+<ol style="list-style-type: decimal;">
+<li dir="ltr"><span>Cavidades paranasales:</span><span> evaluadas con adecuado desarrollo.</span></li>
+<li dir="ltr"><span>Espacio sublingual:</span><span> con volumen conservado.</span></li>
+<li dir="ltr"><span>Espacio submandibular:</span><span> densidad homogénea.</span></li>
+</ol>
+<p>Conclusión diagnóstica:</p>"""
+
+    new = """<p><span>Hallazgos:</span></p>
+<ul style="list-style-type: disc;">
+<li dir="ltr"><span>Cavidades paranasales:</span><span> evaluadas con adecuado desarrollo.</span></li>
+<li dir="ltr"><span>Espacio sublingual:</span><span> con volumen conservado.</span></li>
+<li dir="ltr"><span>Espacio submandibular:</span><span> densidad homogénea.</span></li>
+</ul>
+<p>Conclusión diagnóstica:</p>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Should use structural diff pattern
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
+
+    # Revert data should contain the original ol
+    assert '<ol' in out, "Revert data should contain original <ol>"
+
+    # Should NOT use tagdiff_replaced
+    assert 'tagdiff_replaced' not in out
+
+    # Text should be clean (no del/ins on identical text)
+    assert '<del class="del"' not in out
+    assert '<ins class="ins"' not in out
+
+    # Surrounding content should be unchanged
+    assert 'Hallazgos:' in out
+    assert 'Conclusión diagnóstica:' in out
+
+
+def test_ul_to_ol_structural_diff_reverse():
+    """Reverse case: ul→ol (bullets→numbered) should also use structural diff."""
+    old = """<ul>
+<li>First item</li>
+<li>Second item</li>
+</ul>"""
+    new = """<ol>
+<li>First item</li>
+<li>Second item</li>
+</ol>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
+
+    # Revert data should contain the original ul
+    assert '<ul' in out, "Revert data should contain original <ul>"
+
+    # Text should NOT be wrapped in del/ins
+    assert '<del class="del"' not in out
+    assert '<ins class="ins"' not in out
+
+
+def test_ol_decimal_to_roman_structural_diff():
+    """Changing list-style-type (decimal→upper-roman) uses structural diff.
+
+    Same tag (ol→ol) but style attribute changes. Should NOT show
+    identical text in del/ins.
+    """
+    old = """<ol style="list-style-type: decimal;">
+<li>Primer hallazgo</li>
+<li>Segundo hallazgo</li>
+</ol>"""
+    new = """<ol style="list-style-type: upper-roman;">
+<li>Primer hallazgo</li>
+<li>Segundo hallazgo</li>
+</ol>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
+
+    # New style should be on visible list
+    assert 'upper-roman' in out
+    # Old style should be in revert data
+    assert 'decimal' in out
+
+    # Text should be clean
+    assert '<del class="del"' not in out
+
+
+def test_structural_list_diff_with_empty_paragraph():
+    """p→li structural diff fires even with <p>&nbsp;</p> between heading and list.
+
+    Bug: An empty paragraph between the heading and list content caused a
+    'replace' opcode (replacing <p> with <ul> START), which the detection
+    logic missed because it only checked 'insert' opcodes.
+    """
+    old = """<p><strong>IMPRESIÓN:</strong></p>
+<p> </p>
+<p>Catéter venoso central correctamente posicionado.</p>
+<p>Signos de enfermedad pulmonar crónica.</p>
+<p>Aterosclerosis aórtica y coronaria.</p>"""
+
+    new = """<p><strong>IMPRESIÓN:</strong></p>
+<ul>
+<li>Catéter venoso central correctamente posicionado.</li>
+<li>Signos de enfermedad pulmonar crónica.</li>
+<li>Aterosclerosis aórtica y coronaria.</li>
+</ul>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Should use structural diff despite the empty <p>
+    assert 'structural-revert-data' in out, "Should have hidden revert data"
+    assert 'diff-bullet-ins' in out, "Should have bullet-ins on LIs"
+    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
+
+    # The empty <p> should be in the revert data
+    assert '<p>' in out, "Revert data should include original <p> tags"
+
+    # Text should NOT be in del/ins
+    assert '<del class="del"' not in out
+    assert '<ins class="ins"' not in out
+
+    # Heading should be unchanged
+    assert 'IMPRESIÓN:' in out
