@@ -1107,6 +1107,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                         # Collect new LI atoms for bullet display
                                         new_li_atoms = [a for a in self._new_atoms[j1 + 1:end_idx_new]
                                                         if a.get('tag') == 'li']
+                                        # Collect old LI atoms for attr comparison
+                                        old_li_atoms = [a for a in self._old_atoms[i1 + 1:end_idx_old]
+                                                        if a.get('tag') == 'li']
 
                                         if new_li_atoms:
                                             with self.diff_group():
@@ -1127,22 +1130,63 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                                 list_qname = new_ev[1][0]
                                                 list_attrs_new = new_ev[1][1]
                                                 list_attrs_new = self.inject_class(list_attrs_new, 'tagdiff_added')
+                                                # Track container attr changes (e.g. style: Arial→Comic Sans)
+                                                list_attrs_new = self.inject_refattr(list_attrs_new, old_attrs)
+                                                if old_t != new_t:
+                                                    list_attrs_new = list_attrs_new | [(QName('data-old-tag'), qname_localname(old_t))]
                                                 if diff_id:
                                                     list_attrs_new = self._set_attr(list_attrs_new, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
                                                 self.enter(new_ev[2], list_qname, list_attrs_new)
 
                                                 # Emit each LI with diff-bullet-ins
-                                                for li_atom in new_li_atoms:
+                                                for li_idx, li_atom in enumerate(new_li_atoms):
                                                     li_evs = li_atom.get('events', [])
                                                     if li_evs and li_evs[0][0] == START:
                                                         li_tag = li_evs[0][1][0]
                                                         li_attrs = li_evs[0][1][1]
                                                         li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
+
+                                                        # Check if this LI has attr changes vs old
+                                                        old_li_evs = None
+                                                        li_style_changed = False
+                                                        if li_idx < len(old_li_atoms):
+                                                            old_li_evs = old_li_atoms[li_idx].get('events', [])
+                                                            if old_li_evs and old_li_evs[0][0] == START:
+                                                                old_li_attrs = old_li_evs[0][1][1]
+                                                                li_attrs = self.inject_refattr(li_attrs, old_li_attrs)
+                                                                li_style_changed = (old_li_attrs != li_evs[0][1][1])
+
                                                         if diff_id:
                                                             li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
                                                         self.enter(li_evs[0][2], li_tag, li_attrs)
-                                                        for ev in li_evs[1:-1]:
-                                                            self.append(*ev)
+
+                                                        if li_style_changed and old_li_evs:
+                                                            # Style changed: inline del(old style) + ins(new style)
+                                                            # Put old style on <del> so text renders with old font
+                                                            old_style_val = old_li_attrs.get('style')
+                                                            with self.diff_group():
+                                                                del_tag_attrs = Attrs()
+                                                                if old_style_val:
+                                                                    del_tag_attrs = del_tag_attrs | [(QName('style'), old_style_val)]
+                                                                if diff_id:
+                                                                    del_tag_attrs = del_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
+                                                                self.append(START, (QName('del'), del_tag_attrs), (None, -1, -1))
+                                                                for ev in old_li_evs[1:-1]:
+                                                                    self.append(*ev)
+                                                                self.append(END, QName('del'), (None, -1, -1))
+
+                                                                ins_tag_attrs = Attrs()
+                                                                if diff_id:
+                                                                    ins_tag_attrs = ins_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
+                                                                self.append(START, (QName('ins'), ins_tag_attrs), (None, -1, -1))
+                                                                for ev in li_evs[1:-1]:
+                                                                    self.append(*ev)
+                                                                self.append(END, QName('ins'), (None, -1, -1))
+                                                        else:
+                                                            # No style change: just emit content directly
+                                                            for ev in li_evs[1:-1]:
+                                                                self.append(*ev)
+
                                                         self.leave(li_evs[-1][2], li_evs[-1][1])
 
                                                 # Close list

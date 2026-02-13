@@ -1650,3 +1650,145 @@ def test_structural_list_diff_with_empty_paragraph():
 
     # Heading should be unchanged
     assert 'IMPRESIÓN:' in out
+
+
+def test_list_structural_diff_tracks_container_style_change():
+    """Container style+tag changes tracked via data-old-style and data-old-tag.
+
+    When ul→ol AND the container style changes (e.g. font-family),
+    the new list should have data-old-style and data-old-tag attributes
+    so the frontend can display what changed.
+    """
+    old = """<ul style="font-family: Arial; font-size: 12pt;">
+<li>Primer hallazgo.</li>
+<li>Segundo hallazgo.</li>
+</ul>"""
+    new = """<ol style="font-family: Comic Sans MS; font-size: 12pt;">
+<li>Primer hallazgo.</li>
+<li>Segundo hallazgo.</li>
+</ol>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Structural diff pattern
+    assert 'structural-revert-data' in out
+    assert 'diff-bullet-ins' in out
+    assert 'tagdiff_added' in out
+
+    # Container should track old attrs
+    assert 'data-old-style="font-family: Arial; font-size: 12pt;"' in out
+    assert 'data-old-tag="ul"' in out
+
+    # New style should be present
+    assert 'Comic Sans MS' in out
+
+
+def test_list_structural_diff_tracks_li_style_change():
+    """Per-LI style changes tracked via data-old-style on individual LIs.
+
+    When ul→ol AND the first LI changes font-size (12→14pt),
+    only that LI should get data-old-style. The second LI should NOT.
+    """
+    old = """<ul style="font-size: 12pt;">
+<li style="font-size: 12pt;">Primer hallazgo.</li>
+<li style="font-size: 12pt;">Segundo hallazgo.</li>
+</ul>"""
+    new = """<ol style="font-size: 12pt;">
+<li style="font-size: 14pt;">Primer hallazgo.</li>
+<li style="font-size: 12pt;">Segundo hallazgo.</li>
+</ol>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Structural diff pattern
+    assert 'structural-revert-data' in out
+    assert 'diff-bullet-ins' in out
+
+    # First LI should have data-old-style (font-size changed)
+    assert 'data-old-style="font-size: 12pt;"' in out
+
+    # Only ONE data-old-style on the visible LIs (not on the second LI)
+    import re
+    visible_html = re.split(r'</del>', out, 1)[-1]  # skip revert data
+    assert visible_html.count('data-old-style') == 1, \
+        "Only the changed LI should have data-old-style"
+
+
+def test_list_style_only_change_del_carries_old_style():
+    """Style-only change (ul→ul, Times→Comic Sans): del tag carries old font style.
+
+    When the list type stays the same but font changes, each LI should have
+    inline <del style="old_font">text</del><ins>text</ins> so the old font
+    renders visually on the del text.
+    """
+    old = """<ul style="font-family: Times New Roman; font-size: 12pt;">
+<li style="font-family: Times New Roman; font-size: 12pt;">Catéter venoso central correctamente posicionado.</li>
+<li style="font-family: Times New Roman; font-size: 12pt;">Signos de enfermedad pulmonar crónica.</li>
+<li style="font-family: Times New Roman; font-size: 12pt;">Aterosclerosis aórtica y coronaria.</li>
+</ul>"""
+    new = """<ul style="font-family: Comic Sans MS; font-size: 12pt;">
+<li style="font-family: Comic Sans MS; font-size: 12pt;">Catéter venoso central correctamente posicionado.</li>
+<li style="font-family: Comic Sans MS; font-size: 12pt;">Signos de enfermedad pulmonar crónica.</li>
+<li style="font-family: Comic Sans MS; font-size: 12pt;">Aterosclerosis aórtica y coronaria.</li>
+</ul>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Structural diff pattern
+    assert 'structural-revert-data' in out
+    assert 'diff-bullet-ins' in out
+    assert 'tagdiff_added' in out
+
+    # No tag change (ul→ul)
+    assert 'data-old-tag' not in out
+
+    # del should carry old style for visual rendering
+    assert '<del style="font-family: Times New Roman; font-size: 12pt;"' in out
+    # ins inherits new style from parent LI (no explicit style)
+    assert '<ins data-diff-id=' in out
+
+    # New style on the visible list
+    assert 'Comic Sans MS' in out
+
+
+def test_list_type_and_style_change_del_carries_old_style():
+    """Type+style change (ul→ol, Times→Comic Sans): del tag carries old font.
+
+    Combined change: list type AND font. The visible list should be <ol> with
+    data-old-tag="ul", and each LI del should render in old font style.
+    """
+    old = """<ul style="font-family: Times New Roman; font-size: 12pt;">
+<li style="font-family: Times New Roman; font-size: 12pt;">Catéter venoso central correctamente posicionado.</li>
+<li style="font-family: Times New Roman; font-size: 12pt;">Signos de enfermedad pulmonar crónica.</li>
+<li style="font-family: Times New Roman; font-size: 12pt;">Aterosclerosis aórtica y coronaria.</li>
+</ul>"""
+    new = """<ol style="font-family: Comic Sans MS; font-size: 12pt;">
+<li style="font-family: Comic Sans MS; font-size: 12pt;">Catéter venoso central correctamente posicionado.</li>
+<li style="font-family: Comic Sans MS; font-size: 12pt;">Signos de enfermedad pulmonar crónica.</li>
+<li style="font-family: Comic Sans MS; font-size: 12pt;">Aterosclerosis aórtica y coronaria.</li>
+</ol>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Structural diff pattern
+    assert 'structural-revert-data' in out
+    assert 'diff-bullet-ins' in out
+    assert 'tagdiff_added' in out
+
+    # Tag change tracked
+    assert 'data-old-tag="ul"' in out
+
+    # del should carry old style
+    assert '<del style="font-family: Times New Roman; font-size: 12pt;"' in out
+
+    # New style and tag on visible list
+    assert 'Comic Sans MS' in out
+    assert '<ol' in out
