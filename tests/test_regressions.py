@@ -1869,7 +1869,7 @@ def test_table_only_style_change_leaves_cells_clean():
     assert 'tagdiff_added' in out
     assert 'Comic Sans' in out
 
-    # Visible cells should have NO del/ins (only in the hidden revert data)
+    # Cells should have del/ins because table style change propagates via CSS inheritance.
     visible = re.sub(r'<del class="structural-revert-data"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
-    assert '<del' not in visible
-    assert '<ins' not in visible
+    assert '<del' in visible
+    assert '<ins' in visible

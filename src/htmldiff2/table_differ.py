@@ -165,7 +165,7 @@ def best_single_insert_index(oldk, newk):
     return best_k
 
 
-def diff_tr_by_cells(differ, old_tr_events, new_tr_events):
+def diff_tr_by_cells(differ, old_tr_events, new_tr_events, table_old_style=None):
     """
     Diff a table row by aligning direct child cells (<td>/<th>) with a row-aware
     algorithm that prefers preserving left-to-right structure.
@@ -228,6 +228,39 @@ def diff_tr_by_cells(differ, old_tr_events, new_tr_events):
         same_attrs = _attrs_equal_normalized(old_attrs, new_attrs)
         
         if same_text and same_attrs:
+            if table_old_style:
+                # Table style changed (inherited via CSS) but cell attrs identical.
+                # Emit del(table old style)/ins so user sees old vs new font.
+                cell_tag = new_events[0][1][0]
+                cell_attrs = new_events[0][1][1]
+                diff_id = differ._new_diff_id() if getattr(differ.config, 'add_diff_ids', False) else None
+                if diff_id:
+                    cell_attrs = differ._set_attr(cell_attrs, getattr(differ.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                differ.append(START, (cell_tag, cell_attrs), new_events[0][2])
+
+                old_content = old_events[1:-1]
+                new_content = new_events[1:-1]
+
+                with differ.diff_group():
+                    del_attrs = Attrs([(QName('style'), table_old_style)])
+                    inner_id = differ._new_diff_id() if diff_id else None
+                    if inner_id:
+                        del_attrs = del_attrs | [(QName(getattr(differ.config, 'diff_id_attr', 'data-diff-id')), inner_id)]
+                    differ.append(START, (QName('del'), del_attrs), (None, -1, -1))
+                    for ev in old_content:
+                        differ.append(*ev)
+                    differ.append(END, QName('del'), (None, -1, -1))
+
+                    ins_attrs = Attrs()
+                    if inner_id:
+                        ins_attrs = ins_attrs | [(QName(getattr(differ.config, 'diff_id_attr', 'data-diff-id')), differ._new_diff_id())]
+                    differ.append(START, (QName('ins'), ins_attrs), (None, -1, -1))
+                    for ev in new_content:
+                        differ.append(*ev)
+                    differ.append(END, QName('ins'), (None, -1, -1))
+
+                differ.append(*new_events[-1])
+                return
             # No change at all: emit new cell as-is (unchanged)
             for ev in new_events:
                 differ.append(*ev)
@@ -427,10 +460,13 @@ def diff_table_by_rows(differ, old_table_events, new_table_events):
     old_table_start = old_table_events[0]
     new_table_start = new_table_events[0]
     table_attrs_changed = False
+    old_table_style = None
     if old_table_start[0] == START and new_table_start[0] == START:
         old_attrs = old_table_start[1][1]
         new_attrs = new_table_start[1][1]
         table_attrs_changed = not _attrs_equal_normalized(old_attrs, new_attrs)
+        if table_attrs_changed:
+            old_table_style = old_attrs.get('style') or ''
 
     # If table attrs changed, emit hidden <del> with old table for revert,
     # then emit new table with tagdiff_added (same pattern as lists).
@@ -468,7 +504,8 @@ def diff_table_by_rows(differ, old_table_events, new_table_events):
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
             for oi, nj in zip(range(i1, i2), range(j1, j2)):
-                diff_tr_by_cells(differ, old_rows[oi], new_rows[nj])
+                diff_tr_by_cells(differ, old_rows[oi], new_rows[nj],
+                                 table_old_style=old_table_style if table_attrs_changed else None)
         elif tag == "delete":
             with differ.diff_group():
                 with differ.context("del"):
@@ -483,7 +520,8 @@ def diff_table_by_rows(differ, old_table_events, new_table_events):
             # Pair rows positionally where possible
             n = min(i2 - i1, j2 - j1)
             for k in range(n):
-                diff_tr_by_cells(differ, old_rows[i1 + k], new_rows[j1 + k])
+                diff_tr_by_cells(differ, old_rows[i1 + k], new_rows[j1 + k],
+                                 table_old_style=old_table_style if table_attrs_changed else None)
             if (i2 - i1) > n:
                 with differ.diff_group():
                     with differ.context("del"):
