@@ -8,12 +8,29 @@ It handles column insertion/deletion, row alignment, and cell-level diffs.
 from __future__ import with_statement
 
 from difflib import SequenceMatcher
-from genshi.core import START, END
+from genshi.core import START, END, Attrs, QName
 
 from .utils import (
     qname_localname, collapse_ws, extract_text_from_events,
-    attrs_signature, structure_signature
+    attrs_signature, structure_signature, normalize_style_value
 )
+
+
+def _attrs_equal_normalized(attrs1, attrs2):
+    """Compare two Attrs objects with normalized style values (order-independent)."""
+    def _normalize(attrs):
+        result = {}
+        try:
+            for k, v in attrs:
+                k_str = str(k)
+                if k_str == 'style' and v:
+                    result[k_str] = normalize_style_value(v)
+                else:
+                    result[k_str] = v
+        except Exception:
+            return attrs
+        return result
+    return _normalize(attrs1) == _normalize(attrs2)
 
 
 def extract_direct_tr_cells(tr_events):
@@ -191,51 +208,107 @@ def diff_tr_by_cells(differ, old_tr_events, new_tr_events):
         
         When text differs, emit a SINGLE cell wrapper with inline del/ins
         for the content, instead of two separate cells (which creates an extra column).
+        When only style changes, emit inline del(old style)/ins(new style).
         """
-        # If the visible text is the same, prefer an inner diff so style/attrs
-        # changes do NOT shift column alignment.
-        if _align_key(old_cell) == _align_key(new_cell):
-            inner = _EventDiffer(old_cell['events'], new_cell['events'], differ.config, diff_id_state=differ._diff_id_state)
-            for ev in inner.get_diff_events():
-                differ.append(*ev)
-            return
-        
-        # Text differs: emit SINGLE cell with inline del/ins content.
-        # Use old cell's wrapper (preserves original structure/attrs).
         old_events = old_cell['events']
         new_events = new_cell['events']
         
-        # Find the cell wrapper START and END
-        # old_events[0] = (START, (tag, attrs), pos)
-        # old_events[-1] = (END, tag, pos)
         if not old_events or old_events[0][0] != START or old_events[-1][0] != END:
-            # Fallback: emit both cells (shouldn't happen)
+            # Fallback
             with differ.diff_group():
                 with differ.context('del'):
                     differ.block_process(old_events)
                 with differ.context('ins'):
                     differ.block_process(new_events)
             return
+
+        old_attrs = old_events[0][1][1]
+        new_attrs = new_events[0][1][1] if new_events and new_events[0][0] == START else old_attrs
+        same_text = (_align_key(old_cell) == _align_key(new_cell))
+        same_attrs = _attrs_equal_normalized(old_attrs, new_attrs)
         
-        cell_start = old_events[0]
-        cell_end = old_events[-1]
-        old_content = old_events[1:-1]  # Content between <td> and </td>
+        if same_text and same_attrs:
+            # No change at all: emit new cell as-is (unchanged)
+            for ev in new_events:
+                differ.append(*ev)
+            return
+        
+        if same_text and not same_attrs:
+            # Style-only change: emit new cell wrapper (plain, no extra class),
+            # then inline del(old style) + ins(new content).
+            cell_tag = new_events[0][1][0]
+            cell_attrs = new_events[0][1][1]
+            diff_id = differ._new_diff_id() if getattr(differ.config, 'add_diff_ids', False) else None
+            if diff_id:
+                cell_attrs = differ._set_attr(cell_attrs, getattr(differ.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+            differ.append(START, (cell_tag, cell_attrs), new_events[0][2])
+            
+            old_content = old_events[1:-1]
+            new_content = new_events[1:-1]
+            
+            with differ.diff_group():
+                # Del with old style
+                old_style_val = old_attrs.get('style')
+                del_attrs = Attrs()
+                if old_style_val:
+                    del_attrs = del_attrs | [(QName('style'), old_style_val)]
+                inner_diff_id = differ._new_diff_id() if diff_id else None
+                if inner_diff_id:
+                    del_attrs = del_attrs | [(QName(getattr(differ.config, 'diff_id_attr', 'data-diff-id')), inner_diff_id)]
+                differ.append(START, (QName('del'), del_attrs), (None, -1, -1))
+                for ev in old_content:
+                    differ.append(*ev)
+                differ.append(END, QName('del'), (None, -1, -1))
+                
+                # Ins inherits new style from cell wrapper
+                ins_attrs = Attrs()
+                if inner_diff_id:
+                    ins_attrs = ins_attrs | [(QName(getattr(differ.config, 'diff_id_attr', 'data-diff-id')), differ._new_diff_id())]
+                differ.append(START, (QName('ins'), ins_attrs), (None, -1, -1))
+                for ev in new_content:
+                    differ.append(*ev)
+                differ.append(END, QName('ins'), (None, -1, -1))
+            
+            differ.append(*new_events[-1])
+            return
+        
+        # Text differs: emit SINGLE cell with inline del/ins content.
+        # Use new cell's wrapper (preserves new styles).
+        cell_start = new_events[0]
+        cell_end = new_events[-1]
+        old_content = old_events[1:-1]
         new_content = new_events[1:-1] if len(new_events) > 2 else []
         
-        # Emit single cell wrapper
-        differ.append(*cell_start)
+        # Emit new cell wrapper (plain, no extra class)
+        cell_tag = cell_start[1][0]
+        cell_attrs = cell_start[1][1]
+        differ.append(START, (cell_tag, cell_attrs), cell_start[2])
         
         with differ.diff_group():
-            # Deleted content
             if old_content:
-                with differ.context('del'):
-                    differ.block_process(old_content)
-            # Inserted content
+                # Del with old style if style changed
+                del_tag_attrs = Attrs()
+                if not same_attrs:
+                    old_style_val = old_attrs.get('style')
+                    if old_style_val:
+                        del_tag_attrs = del_tag_attrs | [(QName('style'), old_style_val)]
+                diff_id = differ._new_diff_id() if getattr(differ.config, 'add_diff_ids', False) else None
+                if diff_id:
+                    del_tag_attrs = del_tag_attrs | [(QName(getattr(differ.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+                differ.append(START, (QName('del'), del_tag_attrs), (None, -1, -1))
+                for ev in old_content:
+                    differ.append(*ev)
+                differ.append(END, QName('del'), (None, -1, -1))
             if new_content:
-                with differ.context('ins'):
-                    differ.block_process(new_content)
+                ins_attrs = Attrs()
+                diff_id = differ._new_diff_id() if getattr(differ.config, 'add_diff_ids', False) else None
+                if diff_id:
+                    ins_attrs = ins_attrs | [(QName(getattr(differ.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+                differ.append(START, (QName('ins'), ins_attrs), (None, -1, -1))
+                for ev in new_content:
+                    differ.append(*ev)
+                differ.append(END, QName('ins'), (None, -1, -1))
         
-        # Close cell
         differ.append(*cell_end)
 
     # Special-case: single-column removal/addition. Do a positional alignment
@@ -285,10 +358,8 @@ def diff_tr_by_cells(differ, old_tr_events, new_tr_events):
     j = 0
     while i < len(old_cells) or j < len(new_cells):
         if i < len(old_cells) and j < len(new_cells) and old_align[i] == new_align[j]:
-            # Same cell -> inner diff to catch formatting/text changes.
-            inner = _EventDiffer(old_cells[i]['events'], new_cells[j]['events'], differ.config, diff_id_state=differ._diff_id_state)
-            for ev in inner.get_diff_events():
-                differ.append(*ev)
+            # Same cell -> diff through _diff_cell_pair which normalizes styles.
+            _diff_cell_pair(old_cells[i], new_cells[j])
             i += 1
             j += 1
             continue
@@ -352,9 +423,41 @@ def diff_table_by_rows(differ, old_table_events, new_table_events):
             differ.append(*ev)
         return
 
-    # Emit the table wrapper from the OLD side (keeps structure valid; inner diffs
-    # will mark style/attr changes at cell level).
-    differ.append(*old_table_events[0])
+    # Check whether the table wrapper attrs changed (style, etc.)
+    old_table_start = old_table_events[0]
+    new_table_start = new_table_events[0]
+    table_attrs_changed = False
+    if old_table_start[0] == START and new_table_start[0] == START:
+        old_attrs = old_table_start[1][1]
+        new_attrs = new_table_start[1][1]
+        table_attrs_changed = not _attrs_equal_normalized(old_attrs, new_attrs)
+
+    # If table attrs changed, emit hidden <del> with old table for revert,
+    # then emit new table with tagdiff_added (same pattern as lists).
+    if table_attrs_changed:
+        # Hidden structural revert data
+        del_attrs = Attrs([(QName('class'), 'structural-revert-data'),
+                           (QName('style'), 'display:none')])
+        diff_id = differ._new_diff_id() if getattr(differ.config, 'add_diff_ids', False) else None
+        if diff_id:
+            del_attrs = del_attrs | [(QName(getattr(differ.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+        differ.append(START, (QName('del'), del_attrs), (None, -1, -1))
+        for ev in old_table_events:
+            differ.append(*ev)
+        differ.append(END, QName('del'), (None, -1, -1))
+
+        # Emit new table wrapper with tagdiff_added + data-old-*
+        new_tag = new_table_start[1][0]
+        new_attrs_out = new_table_start[1][1]
+        new_attrs_out = differ.inject_class(new_attrs_out, 'tagdiff_added')
+        new_attrs_out = differ.inject_refattr(new_attrs_out, old_attrs)
+        if diff_id:
+            new_attrs_out = differ._set_attr(new_attrs_out, getattr(differ.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+        differ.append(START, (new_tag, new_attrs_out), new_table_start[2])
+    elif old_table_start[0] == START:
+        differ.append(*new_table_events[0])
+    else:
+        differ.append(*new_table_events[0])
 
     old_rows = extract_tr_blocks(old_table_events)
     new_rows = extract_tr_blocks(new_table_events)
@@ -392,5 +495,5 @@ def diff_table_by_rows(differ, old_table_events, new_table_events):
                         for nj in range(j1 + n, j2):
                             differ.block_process(new_rows[nj])
 
-    # Emit closing </table> from OLD wrapper.
-    differ.append(*old_table_events[-1])
+    # Emit closing </table> from NEW wrapper.
+    differ.append(*new_table_events[-1])

@@ -804,7 +804,9 @@ def test_remove_localizacion_with_style_changes_does_not_delete_medidas():
 </table>"""
 
     out = htmldiff2.render_html_diff(old, new)
-    root = _parse_fragment(out)
+    # Strip the hidden structural-revert-data section before parsing
+    visible_out = re.sub(r'<del class="structural-revert-data"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+    root = _parse_fragment(visible_out)
 
     # Look at the header row and validate column tagging without relying on
     # exact unicode rendering in assertion output.
@@ -1792,3 +1794,82 @@ def test_list_type_and_style_change_del_carries_old_style():
     # New style and tag on visible list
     assert 'Comic Sans MS' in out
     assert '<ol' in out
+
+
+def test_table_style_order_does_not_trigger_diff():
+    """Same table/cell styles in different order should NOT trigger any diff."""
+    old = """<table border="1" style="border-collapse: collapse; width: 100%;">
+<tbody><tr>
+<td style="padding: 8px; text-align: left;">Bazo</td>
+<td style="text-align: left; padding: 8px;">Normal</td>
+</tr></tbody></table>"""
+    new = """<table border="1" style="width: 100%; border-collapse: collapse;">
+<tbody><tr>
+<td style="text-align: left; padding: 8px;">Bazo</td>
+<td style="padding: 8px; text-align: left;">Normal</td>
+</tr></tbody></table>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+    assert 'tagdiff_replaced' not in out
+    assert 'tagdiff_added' not in out
+    assert 'structural-revert-data' not in out
+    assert '<del' not in out
+    assert '<ins' not in out
+
+
+def test_table_style_change_structural_diff_with_del_ins_per_cell():
+    """Real table+cell style change: structural revert + del(old style)/ins per cell.
+
+    When cell style changes (e.g. adding font-family), each cell should have
+    inline <del style="old_style">text</del><ins>text</ins>.
+    """
+    old = """<table border="1" style="border-collapse: collapse; width: 100%;">
+<tbody><tr>
+<td style="padding: 8px;">Bazo</td>
+<td style="padding: 8px;">Normal</td>
+</tr></tbody></table>"""
+    new = """<table border="1" style="border-collapse: collapse; font-family: 'Comic Sans MS'; width: 100%;">
+<tbody><tr>
+<td style="padding: 8px; font-family: 'Comic Sans MS';">Bazo</td>
+<td style="padding: 8px; font-family: 'Comic Sans MS';">Normal</td>
+</tr></tbody></table>"""
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Structural pattern (same as lists)
+    assert 'structural-revert-data' in out
+    assert 'tagdiff_added' in out
+    assert 'tagdiff_replaced' not in out
+
+    # del carries old style, ins inherits new from cell
+    assert '<del style="padding: 8px;"' in out
+    assert '<ins' in out
+    assert 'Comic Sans' in out
+
+
+def test_table_only_style_change_leaves_cells_clean():
+    """When only <table> style changes but cells are identical, cells have no diff."""
+    old = """<table border="1" style="border-collapse: collapse; width: 100%;">
+<tbody><tr>
+<th style="padding: 8px; text-align: left;">Estructura</th>
+<td style="padding: 8px;">Bazo</td>
+</tr></tbody></table>"""
+    new = """<table border="1" style="border-collapse: collapse; font-family: 'Comic Sans MS', cursive; width: 100%;">
+<tbody><tr>
+<th style="padding: 8px; text-align: left;">Estructura</th>
+<td style="padding: 8px;">Bazo</td>
+</tr></tbody></table>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+
+    # Table structural pattern
+    assert 'structural-revert-data' in out
+    assert 'tagdiff_added' in out
+    assert 'Comic Sans' in out
+
+    # Visible cells should have NO del/ins (only in the hidden revert data)
+    visible = re.sub(r'<del class="structural-revert-data"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+    assert '<del' not in visible
+    assert '<ins' not in visible
