@@ -1873,3 +1873,49 @@ def test_table_only_style_change_leaves_cells_clean():
     visible = re.sub(r'<del class="structural-revert-data"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
     assert '<del' in visible
     assert '<ins' in visible
+
+
+def test_list_inline_span_style_change_uses_del_ins():
+    """Inline span style change inside a list should produce del/ins, not tagdiff_replaced."""
+    old = """<ul>
+<li><span><strong><span><span style="font-style: normal; font-weight: 400;">El parénquima cerebral presenta densidad normal.</span></span></strong></span></li>
+<li>Los ventrículos son normales.</li>
+</ul>"""
+    new = """<ul>
+<li><span><strong><span><span style="font-style: italic; font-weight: 400;">El parénquima cerebral presenta densidad normal.</span></span></strong></span></li>
+<li>Los ventrículos son normales.</li>
+</ul>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+
+    assert 'tagdiff_replaced' not in out
+    assert '<del' in out
+    assert '<ins' in out
+    # del should carry the old style (font-style: normal)
+    assert re.search(r'<del[^>]*font-style:\s*normal', out)
+    # The new span should have font-style: italic
+    assert re.search(r'<span[^>]*font-style:\s*italic', out)
+
+
+def test_table_cell_inner_span_style_change_uses_del_ins():
+    """Inline span style change inside a table cell should produce del/ins, not tagdiff_replaced."""
+    old = """<table border="1" style="border-collapse: collapse; width: 100%;">
+<tbody><tr>
+<td style="padding: 8px;">Parénquima</td>
+<td style="padding: 8px;"><span style="font-style: normal; font-weight: 400;">Densidad normal.</span></td>
+</tr></tbody></table>"""
+    new = """<table border="1" style="border-collapse: collapse; width: 100%;">
+<tbody><tr>
+<td style="padding: 8px;">Parénquima</td>
+<td style="padding: 8px;"><span style="font-style: italic; font-weight: 400;">Densidad normal.</span></td>
+</tr></tbody></table>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+
+    assert 'tagdiff_replaced' not in out
+    assert '<del' in out
+    assert '<ins' in out
+    assert re.search(r'<del[^>]*font-style:\s*normal', out)
+    assert re.search(r'<span[^>]*font-style:\s*italic', out)
+    # Unchanged cell should remain clean
+    assert 'Parénquima</td>' in out

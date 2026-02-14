@@ -78,6 +78,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
         self._diff_id_state = diff_id_state if diff_id_state is not None else [0]
         self._diff_id_stack = []
+        # Stack for buffering content inside style-changed elements.
+        # Each entry: {'tag': QName, 'old_style': str, 'events': list, 'diff_id': str|None}
+        self._style_del_buffer = []
 
     @contextmanager
     def diff_group(self, diff_id=None):
@@ -155,7 +158,11 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         return attrs
 
     def append(self, type, data, pos):
-        self._result.append((type, data, pos))
+        if self._style_del_buffer:
+            # Buffering content for a style-changed element
+            self._style_del_buffer[-1]['events'].append((type, data, pos))
+        else:
+            self._result.append((type, data, pos))
 
     def _handle_replace_special_cases(self, old, new, old_start, old_end, new_start, new_end):
         """Maneja casos especiales de reemplazo antes del procesamiento general."""
@@ -299,6 +306,47 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         self.append(START, (tag, attrs), pos)
 
     def enter_mark_replaced(self, pos, tag, attrs, old_attrs, old_tag=None):
+        from .utils import normalize_style_value
+        # Check if this is a same-tag, style-only change -> use del/ins buffer
+        if (old_tag is None or old_tag == tag):
+            # Check if only style differs (normalize for order)
+            non_style_match = True
+            old_style = old_attrs.get('style') or ''
+            new_style = attrs.get('style') or ''
+            for k, v in attrs:
+                k_str = str(k)
+                if k_str == 'style':
+                    continue
+                old_v = old_attrs.get(k_str)
+                if old_v != v:
+                    non_style_match = False
+                    break
+            if non_style_match:
+                for k, v in old_attrs:
+                    k_str = str(k)
+                    if k_str == 'style':
+                        continue
+                    new_v = attrs.get(k_str)
+                    if new_v != v:
+                        non_style_match = False
+                        break
+            if non_style_match and normalize_style_value(old_style) != normalize_style_value(new_style):
+                # Style-only change on same tag: enter normally, buffer content for del/ins
+                diff_id = None
+                if getattr(self.config, 'add_diff_ids', False):
+                    diff_id = self._active_diff_id() or self._new_diff_id()
+                    attrs = self._set_attr(attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                self._stack.append(tag)
+                self.append(START, (tag, attrs), pos)
+                self._style_del_buffer.append({
+                    'tag': tag,
+                    'old_style': old_style,
+                    'events': [],
+                    'diff_id': diff_id,
+                })
+                return
+
+        # Fallback: use tagdiff_replaced for tag changes or complex attr changes
         attrs = self.inject_class(attrs, 'tagdiff_replaced')
         attrs = self.inject_refattr(attrs, old_attrs)
         if old_tag and old_tag != tag:
@@ -313,6 +361,35 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
         if not self._stack:
             return False
         if tag == self._stack[-1]:
+            # Check if we're closing a style-changed element with buffered content
+            if self._style_del_buffer and self._style_del_buffer[-1]['tag'] == tag:
+                buf = self._style_del_buffer.pop()
+                buffered = buf['events']
+                old_style = buf['old_style']
+                diff_id = buf['diff_id']
+
+                # Emit del with old style
+                del_attrs = Attrs()
+                if old_style:
+                    del_attrs = del_attrs | [(QName('style'), old_style)]
+                if diff_id:
+                    inner_id = self._new_diff_id()
+                    del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), inner_id)]
+                self.append(START, (QName('del'), del_attrs), (None, -1, -1))
+                for ev in buffered:
+                    self.append(*ev)
+                self.append(END, QName('del'), (None, -1, -1))
+
+                # Emit ins
+                ins_attrs = Attrs()
+                if diff_id:
+                    ins_id = self._new_diff_id()
+                    ins_attrs = ins_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), ins_id)]
+                self.append(START, (QName('ins'), ins_attrs), (None, -1, -1))
+                for ev in buffered:
+                    self.append(*ev)
+                self.append(END, QName('ins'), (None, -1, -1))
+
             self.append(END, tag, pos)
             self._stack.pop()
             return True

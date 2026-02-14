@@ -55,6 +55,7 @@ def create_event_differ_class(StreamDiffer):
             self._wrap_change_end_for = []  # stack of (localname, change_tag) for void elements (e.g. img)
             self._diff_id_state = diff_id_state if diff_id_state is not None else [0]
             self._diff_id_stack = []
+            self._style_del_buffer = []
 
         def get_diff_events(self):
             self.process_events()

@@ -261,8 +261,30 @@ def diff_tr_by_cells(differ, old_tr_events, new_tr_events, table_old_style=None)
 
                 differ.append(*new_events[-1])
                 return
-            # No change at all: emit new cell as-is (unchanged)
-            for ev in new_events:
+            # Cell text and attrs are equal. However inner elements may have changed
+            # (e.g. a <span> style change). Check if events are semantically identical
+            # (normalize style order to avoid false positives).
+            def _normalize_event(ev):
+                if ev[0] == START:
+                    tag, attrs = ev[1]
+                    norm_attrs = tuple(
+                        (str(k), normalize_style_value(v) if str(k) == 'style' else v)
+                        for k, v in sorted(attrs, key=lambda x: str(x[0]))
+                    )
+                    return (ev[0], (str(tag), norm_attrs))
+                return (ev[0], ev[1])
+
+            old_norm = [_normalize_event(e) for e in old_events]
+            new_norm = [_normalize_event(e) for e in new_events]
+            if old_norm == new_norm:
+                # Truly identical after normalization: emit as-is
+                for ev in new_events:
+                    differ.append(*ev)
+                return
+            # Inner events differ (style change on child element): use EventDiffer
+            from .differ import _EventDiffer
+            inner = _EventDiffer(old_events, new_events, differ.config, diff_id_state=differ._diff_id_state)
+            for ev in inner.get_diff_events():
                 differ.append(*ev)
             return
         
