@@ -1972,3 +1972,42 @@ def test_ul_to_ol_with_italic_first_item_and_style_stripping():
 
     # Should have structural markers
     assert 'data-old-tag' in out or 'tagdiff_added' in out
+
+
+def test_table_font_change_del_carries_old_inherited_font():
+    """When table font changes (Arial→Comic Sans) and LLM adds font-family to each td,
+    the <del> inside cells should carry the old table font (Arial) so text renders
+    in the original font, not the new one inherited from the parent <td>."""
+    old = (
+        '<table border="1" style="border-collapse: collapse; font-family: Arial; width: 100%;">'
+        '<tbody>'
+        '<tr><td style="padding: 8px;">Hígado</td>'
+        '<td style="padding: 8px;">Parénquima homogéneo.</td></tr>'
+        '<tr><td style="padding: 8px;">Pleura</td>'
+        '<td style="padding: 8px;">Derrame pleural.</td></tr>'
+        '</tbody></table>'
+    )
+    new = (
+        '<table border="1" style="border-collapse: collapse; font-family: \'Comic Sans MS\', cursive; width: 100%;">'
+        '<tbody>'
+        '<tr><td style="font-family: \'Comic Sans MS\', cursive; padding: 8px;">Esófago</td>'
+        '<td style="font-family: \'Comic Sans MS\', cursive; padding: 8px;">Parénquima homogéneo.</td></tr>'
+        '<tr><td style="font-family: \'Comic Sans MS\', cursive; padding: 8px;">Pleura</td>'
+        '<td style="font-family: \'Comic Sans MS\', cursive; padding: 8px;">Derrame pleural.</td></tr>'
+        '</tbody></table>'
+    )
+
+    out = htmldiff2.render_html_diff(old, new)
+
+    # Strip hidden revert data
+    visible = re.sub(r'<del class="(del|structural-revert-data)"[^>]*style="display:none"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+
+    # All visible <del> tags should carry old font (Arial), not Comic Sans
+    del_styles = re.findall(r'<del[^>]*style="([^"]*)"[^>]*>', visible)
+    for s in del_styles:
+        assert 'Arial' in s, f"<del> should carry old font Arial, got: {s}"
+        assert 'Comic Sans' not in s, f"<del> should NOT have new font Comic Sans, got: {s}"
+
+    # Text change should be present
+    assert 'Hígado' in visible
+    assert 'Esófago' in visible

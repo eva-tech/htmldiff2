@@ -165,6 +165,46 @@ def best_single_insert_index(oldk, newk):
     return best_k
 
 
+# CSS properties that are inherited by child elements and thus relevant
+# when comparing old table style vs new table style for del rendering.
+_INHERITABLE_PROPS = ('font-family', 'font-size', 'font-style', 'font-weight', 'color')
+
+
+def _merge_inherited_style(del_style_val, table_old_style):
+    """Merge inheritable CSS props from old table style into the del style.
+
+    When the old cell didn't explicitly set font-family (it inherited from the
+    table), and the table's font changed, the <del> must carry the old
+    table font so it renders in the font the text originally had.
+    """
+    if not table_old_style:
+        return del_style_val
+    # Parse table old style into dict
+    table_props = {}
+    for part in table_old_style.split(';'):
+        part = part.strip()
+        if ':' in part:
+            k, v = part.split(':', 1)
+            table_props[k.strip().lower()] = v.strip()
+    # Parse del style into dict (preserving order)
+    del_props = {}
+    if del_style_val:
+        for part in del_style_val.split(';'):
+            part = part.strip()
+            if ':' in part:
+                k, v = part.split(':', 1)
+                del_props[k.strip().lower()] = v.strip()
+    # Merge inheritable props that are missing from del
+    merged = False
+    for prop in _INHERITABLE_PROPS:
+        if prop in table_props and prop not in del_props:
+            del_props[prop] = table_props[prop]
+            merged = True
+    if not merged:
+        return del_style_val
+    return '; '.join(f'{k}: {v}' for k, v in del_props.items())
+
+
 def diff_tr_by_cells(differ, old_tr_events, new_tr_events, table_old_style=None):
     """
     Diff a table row by aligning direct child cells (<td>/<th>) with a row-aware
@@ -304,6 +344,7 @@ def diff_tr_by_cells(differ, old_tr_events, new_tr_events, table_old_style=None)
             with differ.diff_group():
                 # Del with old style
                 old_style_val = old_attrs.get('style')
+                old_style_val = _merge_inherited_style(old_style_val, table_old_style)
                 del_attrs = Attrs()
                 if old_style_val:
                     del_attrs = del_attrs | [(QName('style'), old_style_val)]
@@ -344,7 +385,11 @@ def diff_tr_by_cells(differ, old_tr_events, new_tr_events, table_old_style=None)
                 # Del with old style if style changed
                 del_tag_attrs = Attrs()
                 if not same_attrs:
-                    old_style_val = old_attrs.get('style')
+                    old_style_val = _merge_inherited_style(old_attrs.get('style'), table_old_style)
+                    if old_style_val:
+                        del_tag_attrs = del_tag_attrs | [(QName('style'), old_style_val)]
+                elif table_old_style:
+                    old_style_val = _merge_inherited_style(None, table_old_style)
                     if old_style_val:
                         del_tag_attrs = del_tag_attrs | [(QName('style'), old_style_val)]
                 diff_id = differ._new_diff_id() if getattr(differ.config, 'add_diff_ids', False) else None
