@@ -2047,3 +2047,34 @@ def test_ol_font_only_change_no_bullet_markers():
     ins_matches = re.findall(r'<ins[^>]*>.*?</ins>', visible, flags=re.DOTALL)
     assert len(del_matches) >= 2, f"Expected 2+ del for li items, got {len(del_matches)}"
     assert len(ins_matches) >= 2, f"Expected 2+ ins for li items, got {len(ins_matches)}"
+
+
+def test_ol_font_added_del_uses_initial():
+    """When old ol had NO font-family and new ol adds one, del should use
+    font-family: initial to prevent inheriting the new font from parent."""
+    old = (
+        '<ol style="font-size: medium; font-style: normal;">'
+        '<li><span style="font-size: 10pt;">Item one.</span></li>'
+        '<li><span style="font-size: 10pt;">Item two.</span></li>'
+        '</ol>'
+    )
+    new = (
+        '<ol style="font-family: \'Comic Sans MS\', cursive; font-size: medium; font-style: normal;">'
+        '<li><span style="font-size: 10pt;">Item one.</span></li>'
+        '<li><span style="font-size: 10pt;">Item two.</span></li>'
+        '</ol>'
+    )
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Strip hidden revert data
+    visible = re.sub(r'<del class="(del|structural-revert-data)"[^>]*style="display:none"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+
+    # del should carry font-family: initial (not inherit Comic Sans from parent ol)
+    del_styles = re.findall(r'<del[^>]*style="([^"]*)"[^>]*>', visible)
+    assert len(del_styles) >= 2, f"Expected 2+ del with style, got {len(del_styles)}"
+    for s in del_styles:
+        assert 'font-family: initial' in s, f"del should have font-family: initial, got: {s}"
+        assert 'Comic' not in s, f"del should NOT have Comic Sans, got: {s}"

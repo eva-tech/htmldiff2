@@ -1297,7 +1297,9 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                                 inherited_changed = {}
                                                 for prop in _INHERITABLE:
                                                     if old_css.get(prop) != new_css.get(prop) and (prop in old_css or prop in new_css):
-                                                        inherited_changed[prop] = old_css.get(prop, '')
+                                                        # Use old value if it existed, otherwise 'initial'
+                                                        # to prevent del from inheriting the new value
+                                                        inherited_changed[prop] = old_css.get(prop) or 'initial'
 
                                                 # Emit each LI
                                                 for li_idx, li_atom in enumerate(new_li_atoms):
@@ -1358,7 +1360,7 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                                             # Add inherited props that the old li didn't explicitly have
                                                             merged = dict(old_li_css)
                                                             for prop, val in inherited_changed.items():
-                                                                if prop not in merged and val:
+                                                                if prop not in merged:
                                                                     merged[prop] = val
                                                             merged_style = '; '.join(f'{k}: {v}' for k, v in merged.items()) if merged else ''
                                                             with self.diff_group():
