@@ -1250,25 +1250,63 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                                     self.append(*ev)
                                                 self.append(END, QName('del'), (None, -1, -1))
 
-                                                # Emit new list with tagdiff_added
+                                                # Determine if this is a bullet-visual change:
+                                                # - tag swap (ul↔ol): bullets change (dots→numbers)
+                                                # - list-style-type changed: bullets change (1,2,3→I,II,III)
+                                                # Font/color-only changes are NOT bullet changes.
+                                                def _get_lst(style_val):
+                                                    for p in (style_val or '').split(';'):
+                                                        p = p.strip()
+                                                        if p.lower().startswith('list-style-type'):
+                                                            return p.split(':', 1)[1].strip().lower()
+                                                    return None
+                                                old_lst = _get_lst(old_attrs.get('style'))
+                                                new_lst = _get_lst(new_ev[1][1].get('style'))
+                                                is_bullet_change = (old_t != new_t) or (old_lst != new_lst and (old_lst is not None or new_lst is not None))
+
+                                                # Emit new list with appropriate class
                                                 list_qname = new_ev[1][0]
                                                 list_attrs_new = new_ev[1][1]
-                                                list_attrs_new = self.inject_class(list_attrs_new, 'tagdiff_added')
+                                                if is_bullet_change:
+                                                    list_attrs_new = self.inject_class(list_attrs_new, 'tagdiff_added')
+                                                    if old_t != new_t:
+                                                        list_attrs_new = list_attrs_new | [(QName('data-old-tag'), qname_localname(old_t))]
+                                                else:
+                                                    list_attrs_new = self.inject_class(list_attrs_new, 'tagdiff_replaced')
                                                 # Track container attr changes (e.g. style: Arial→Comic Sans)
                                                 list_attrs_new = self.inject_refattr(list_attrs_new, old_attrs)
-                                                if old_t != new_t:
-                                                    list_attrs_new = list_attrs_new | [(QName('data-old-tag'), qname_localname(old_t))]
                                                 if diff_id:
                                                     list_attrs_new = self._set_attr(list_attrs_new, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
                                                 self.enter(new_ev[2], list_qname, list_attrs_new)
 
-                                                # Emit each LI with diff-bullet-ins
+                                                # Compute inherited style diff from list container
+                                                # (for propagating font changes down to li del/ins)
+                                                _INHERITABLE = ('font-family', 'font-size', 'font-style', 'font-weight', 'color')
+                                                old_list_style = old_attrs.get('style', '')
+                                                new_list_style = new_ev[1][1].get('style', '')
+                                                def _parse_css(s):
+                                                    d = {}
+                                                    for p in s.split(';'):
+                                                        p = p.strip()
+                                                        if ':' in p:
+                                                            k, v = p.split(':', 1)
+                                                            d[k.strip().lower()] = v.strip()
+                                                    return d
+                                                old_css = _parse_css(old_list_style)
+                                                new_css = _parse_css(new_list_style)
+                                                inherited_changed = {}
+                                                for prop in _INHERITABLE:
+                                                    if old_css.get(prop) != new_css.get(prop) and (prop in old_css or prop in new_css):
+                                                        inherited_changed[prop] = old_css.get(prop, '')
+
+                                                # Emit each LI
                                                 for li_idx, li_atom in enumerate(new_li_atoms):
                                                     li_evs = li_atom.get('events', [])
                                                     if li_evs and li_evs[0][0] == START:
                                                         li_tag = li_evs[0][1][0]
                                                         li_attrs = li_evs[0][1][1]
-                                                        li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
+                                                        if is_bullet_change:
+                                                            li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
 
                                                         # Check if this LI has attr changes vs old
                                                         old_li_evs = None
@@ -1311,6 +1349,35 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                                             inner = _EventDiffer(old_li_evs[1:-1], li_evs[1:-1], self.config, diff_id_state=self._diff_id_state)
                                                             for ev in inner.get_diff_events():
                                                                 self.append(*ev)
+                                                        elif inherited_changed and old_li_evs:
+                                                            # List container style changed with inheritable props
+                                                            # (e.g. font-family added) but li content is identical.
+                                                            # Emit del(old inherited style)/ins.
+                                                            old_li_style = old_li_attrs.get('style', '') if li_idx < len(old_li_atoms) else ''
+                                                            old_li_css = _parse_css(old_li_style)
+                                                            # Add inherited props that the old li didn't explicitly have
+                                                            merged = dict(old_li_css)
+                                                            for prop, val in inherited_changed.items():
+                                                                if prop not in merged and val:
+                                                                    merged[prop] = val
+                                                            merged_style = '; '.join(f'{k}: {v}' for k, v in merged.items()) if merged else ''
+                                                            with self.diff_group():
+                                                                del_tag_attrs = Attrs()
+                                                                if merged_style:
+                                                                    del_tag_attrs = del_tag_attrs | [(QName('style'), merged_style)]
+                                                                if diff_id:
+                                                                    del_tag_attrs = del_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
+                                                                self.append(START, (QName('del'), del_tag_attrs), (None, -1, -1))
+                                                                for ev in old_li_evs[1:-1]:
+                                                                    self.append(*ev)
+                                                                self.append(END, QName('del'), (None, -1, -1))
+                                                                ins_tag_attrs = Attrs()
+                                                                if diff_id:
+                                                                    ins_tag_attrs = ins_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
+                                                                self.append(START, (QName('ins'), ins_tag_attrs), (None, -1, -1))
+                                                                for ev in li_evs[1:-1]:
+                                                                    self.append(*ev)
+                                                                self.append(END, QName('ins'), (None, -1, -1))
                                                         else:
                                                             # No change: just emit content directly
                                                             for ev in li_evs[1:-1]:

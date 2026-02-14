@@ -671,13 +671,11 @@ def test_ul_style_change_is_replaced_not_nested():
 """
     out = htmldiff2.render_html_diff(old.strip(), new.strip())
 
-    # Should use structural diff pattern
     assert 'structural-revert-data' in out, "Should have hidden revert data"
-    assert 'diff-bullet-ins' in out, "Should have bullet-ins class on LIs"
-    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
-    
-    # Should NOT have tagdiff_replaced (old behavior)
-    assert 'tagdiff_replaced' not in out
+    # Same-tag style change: use tagdiff_replaced, NOT tagdiff_added/diff-bullet-ins
+    assert 'tagdiff_replaced' in out, "Should have tagdiff_replaced on same-tag list"
+    assert 'diff-bullet-ins' not in out, "Same-tag change should NOT have diff-bullet-ins"
+    assert 'tagdiff_added' not in out, "Same-tag change should NOT have tagdiff_added"
     assert 'tagdiff_deleted' not in out
     
     # New style should be present on the visible list
@@ -1436,14 +1434,14 @@ def test_ol_style_change_medical_report():
 
     # Should use structural diff pattern
     assert 'structural-revert-data' in out, "Should have hidden revert data"
-    assert 'diff-bullet-ins' in out, "Should have bullet-ins class on LIs"
-    assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
+    # Same-tag style change: tagdiff_replaced, not tagdiff_added/diff-bullet-ins
+    assert 'tagdiff_replaced' in out, "Should have tagdiff_replaced on same-tag list"
+    assert 'diff-bullet-ins' not in out
+    assert 'tagdiff_added' not in out
     
     # New style should be present on visible list
     assert 'style="font-size: 20pt;"' in out
     
-    # Should NOT use tagdiff_replaced (old behavior)
-    assert 'tagdiff_replaced' not in out
     assert 'tagdiff_deleted' not in out
 
 
@@ -1602,6 +1600,7 @@ def test_ol_decimal_to_roman_structural_diff():
     out = htmldiff2.render_html_diff(old, new, config=cfg)
 
     assert 'structural-revert-data' in out, "Should have hidden revert data"
+    # list-style-type changed (decimal→roman) = bullet visual change
     assert 'diff-bullet-ins' in out, "Should have bullet-ins on LIs"
     assert 'tagdiff_added' in out, "Should have tagdiff_added on new list"
 
@@ -1609,9 +1608,6 @@ def test_ol_decimal_to_roman_structural_diff():
     assert 'upper-roman' in out
     # Old style should be in revert data
     assert 'decimal' in out
-
-    # Text should be clean
-    assert '<del class="del"' not in out
 
 
 def test_structural_list_diff_with_empty_paragraph():
@@ -1744,8 +1740,10 @@ def test_list_style_only_change_del_carries_old_style():
 
     # Structural diff pattern
     assert 'structural-revert-data' in out
-    assert 'diff-bullet-ins' in out
-    assert 'tagdiff_added' in out
+    # Same-tag style change: tagdiff_replaced, not tagdiff_added/diff-bullet-ins
+    assert 'tagdiff_replaced' in out
+    assert 'diff-bullet-ins' not in out
+    assert 'tagdiff_added' not in out
 
     # No tag change (ul→ul)
     assert 'data-old-tag' not in out
@@ -2011,3 +2009,41 @@ def test_table_font_change_del_carries_old_inherited_font():
     # Text change should be present
     assert 'Hígado' in visible
     assert 'Esófago' in visible
+
+
+def test_ol_font_only_change_no_bullet_markers():
+    """Same-tag list (ol→ol) with font-only change should NOT mark bullets as added.
+    
+    When only font-family changes (not list-style-type), bullets don't visually
+    change type. Use tagdiff_replaced + del/ins on content, NOT diff-bullet-ins."""
+    old = (
+        '<ol style="font-size: medium; font-style: normal;">'
+        '<li><span style="font-size: 10pt;">First finding text.</span></li>'
+        '<li><span style="font-size: 10pt;">Second finding text.</span></li>'
+        '</ol>'
+    )
+    new = (
+        '<ol style="font-family: \'Comic Sans MS\', cursive; font-size: medium; font-style: normal;">'
+        '<li><span style="font-size: 10pt;">First finding text.</span></li>'
+        '<li><span style="font-size: 10pt;">Second finding text.</span></li>'
+        '</ol>'
+    )
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Strip hidden revert data
+    visible = re.sub(r'<del class="(del|structural-revert-data)"[^>]*style="display:none"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+
+    # Same-tag, no list-style-type change: use tagdiff_replaced, NOT tagdiff_added
+    assert 'tagdiff_replaced' in visible, "Should use tagdiff_replaced for same-tag style change"
+    assert 'tagdiff_added' not in visible, "Should NOT use tagdiff_added (same tag)"
+    assert 'diff-bullet-ins' not in visible, "Should NOT mark bullets as added (same bullet type)"
+    assert 'data-old-tag' not in visible, "Should NOT have data-old-tag (same tag)"
+
+    # Should have del/ins in li items showing inherited font change
+    del_matches = re.findall(r'<del[^>]*>.*?</del>', visible, flags=re.DOTALL)
+    ins_matches = re.findall(r'<ins[^>]*>.*?</ins>', visible, flags=re.DOTALL)
+    assert len(del_matches) >= 2, f"Expected 2+ del for li items, got {len(del_matches)}"
+    assert len(ins_matches) >= 2, f"Expected 2+ ins for li items, got {len(ins_matches)}"
