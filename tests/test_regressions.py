@@ -1919,3 +1919,56 @@ def test_table_cell_inner_span_style_change_uses_del_ins():
     assert re.search(r'<span[^>]*font-style:\s*italic', out)
     # Unchanged cell should remain clean
     assert 'Parénquima</td>' in out
+
+
+def test_ul_to_ol_with_italic_first_item_and_style_stripping():
+    """ul→ol + <i> wrapper on first item + style stripped from other li items.
+
+    Item 1: should show del/ins for the italic (<i>) change.
+    Items 2-4: should show del/ins for style removal.
+    Items 5-6: new items from merged second list, no del/ins needed.
+    """
+    old = """<ul>
+<li><span style="font-size: medium;"><span style="font-style: normal;"><span style="font-size: medium;">El parénquima cerebral presenta densidad normal.</span></span></span></li>
+<li style="font-size: medium; font-style: normal; font-weight: 400;">Los ventrículos son normales.</li>
+<li style="font-size: medium; font-style: normal; font-weight: 400;">Las estructuras de la línea media están normales.</li>
+</ul>
+<ul>
+<li style="font-size: medium; font-style: normal; font-weight: 400;">Los senos paranasales están aireados.</li>
+</ul>"""
+    new = """<ol>
+<li><span style="font-size: medium;"><span style="font-style: normal;"><span style="font-size: medium;"><i>El parénquima cerebral presenta densidad normal.</i></span></span></span></li>
+<li>Los ventrículos son normales.</li>
+<li>Las estructuras de la línea media están normales.</li>
+<li>Los senos paranasales están aireados.</li>
+</ol>"""
+
+    out = htmldiff2.render_html_diff(old, new)
+
+    # Strip hidden revert data to only test the visible output
+    visible = re.sub(r'<del class="(del|structural-revert-data)"[^>]*style="display:none"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+
+    # Item 1: italic change should produce del/ins
+    item1 = re.search(r'<li[^>]*>.*?parénquima.*?</li>', visible, re.DOTALL)
+    assert item1, "Item 1 not found"
+    t1 = item1.group()
+    assert '<del' in t1, "Item 1 should have <del> for old content without <i>"
+    assert '<ins' in t1, "Item 1 should have <ins> for new content with <i>"
+    assert '<i>' in t1, "Item 1 should contain <i> tag"
+
+    # Items 2-3: style stripped, should show del/ins
+    item2 = re.search(r'<li[^>]*>.*?ventrículos.*?</li>', visible, re.DOTALL)
+    assert item2, "Item 2 not found"
+    t2 = item2.group()
+    assert '<del' in t2, "Item 2 should have <del> for old styled text"
+    assert '<ins' in t2, "Item 2 should have <ins> for new unstyled text"
+
+    # Item 4 (from second ul): should be a clean addition
+    item4 = re.search(r'<li[^>]*>.*?senos paranasales.*?</li>', visible, re.DOTALL)
+    assert item4, "Item 4 not found"
+
+    # No tagdiff_replaced anywhere
+    assert 'tagdiff_replaced' not in out
+
+    # Should have structural markers
+    assert 'data-old-tag' in out or 'tagdiff_added' in out
