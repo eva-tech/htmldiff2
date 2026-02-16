@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Clases principales para realizar diffs de streams de Genshi.
-"""
+
 from __future__ import with_statement
 
 from difflib import SequenceMatcher
@@ -57,11 +55,7 @@ def render_html_diff(old, new, wrapper_element='div', wrapper_class='diff', conf
 
 class StreamDiffer(object):
     """A class that can diff a stream of Genshi events. It will inject
-``<ins>`` and ``<del>`` tags into the stream. It probably breaks
-in very ugly ways if you pass a random Genshi stream to it. I'm
-not exactly sure if it's correct what creoleparser is doing here,
-but it appears that it's not using a namespace. That's fine with me
-so the tags the `StreamDiffer` adds are also unnamespaced.
+``<ins>`` and ``<del>`` tags into the stream.
 """
 
     def __init__(self, old_stream, new_stream, config=None, diff_id_state=None):
@@ -854,14 +848,18 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                     found_structural = False
                     while scan_k < len(opcodes):
                         s_tag, s_i1, s_i2, s_j1, s_j2 = opcodes[scan_k]
-                        if s_tag == 'equal':
-                            # Check old=p blocks, new=li blocks (skip whitespace text atoms)
+                        if s_tag in ('equal', 'replace'):
+                            # Check old=p blocks (or text), new=li blocks (or text)
+                            # 'replace' covers when <p> with <br/> splits into multiple <li>.
                             all_p_to_li = True
                             has_block = False
+                            text_only = True  # Track if range is whitespace-only
+                            end_ev_in_range = None  # END ol/ul found inside this range
                             for ai in range(s_i1, s_i2):
                                 old_a = self._old_atoms[ai]
                                 if old_a.get('kind') == 'text':
                                     continue
+                                text_only = False
                                 if old_a.get('kind') == 'block' and old_a.get('tag') == 'p':
                                     has_block = True
                                     continue
@@ -872,18 +870,32 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                     new_a = self._new_atoms[nj]
                                     if new_a.get('kind') == 'text':
                                         continue
+                                    text_only = False
                                     if new_a.get('kind') == 'block' and new_a.get('tag') == 'li':
                                         has_block = True
                                         continue
+                                    # Check if this is the END ol/ul event
+                                    evs = new_a.get('events', [])
+                                    if (new_a.get('kind') == 'event' and len(evs) == 1
+                                            and evs[0][0] == END
+                                            and qname_localname(evs[0][1]) == list_tag):
+                                        end_ev_in_range = evs[0]
+                                        continue
                                     all_p_to_li = False
                                     break
-                            if all_p_to_li and has_block:
+                            if all_p_to_li and (has_block or text_only):
+                                # Accept: either has p/li blocks, or is whitespace between blocks
                                 bullet_equal_ranges.append((scan_k, s_tag, s_i1, s_i2, s_j1, s_j2))
+                                if end_ev_in_range and bullet_equal_ranges:
+                                    # END event found inside this range — pattern is complete!
+                                    found_structural = True
+                                    scan_k += 1
+                                    break
                                 scan_k += 1
                                 continue
                             else:
                                 break
-                        elif s_tag in ('insert', 'replace'):
+                        elif s_tag == 'insert':
                             # Scan for END ol/ul in the insert range
                             end_ev = None
                             for nj in range(s_j1, s_j2):
@@ -894,120 +906,124 @@ so the tags the `StreamDiffer` adds are also unnamespaced.
                                         end_ev = evs[0]
                                         break
                             if end_ev and bullet_equal_ranges:
-                                # Found complete pattern! Emit structural list diff.
-                                old_p_atoms = []
-                                new_li_atoms = []
-                                # Collect old atoms from the initial replace (e.g. deleted <p> </p>)
-                                if tag == 'replace':
-                                    for ai in range(i1, i2):
-                                        if self._old_atoms[ai].get('kind') == 'block':
-                                            old_p_atoms.append(self._old_atoms[ai])
-                                for _, _, eq_i1, eq_i2, eq_j1, eq_j2 in bullet_equal_ranges:
-                                    for ai in range(eq_i1, eq_i2):
-                                        if self._old_atoms[ai].get('kind') == 'block':
-                                            old_p_atoms.append(self._old_atoms[ai])
-                                    for nj in range(eq_j1, eq_j2):
-                                        if self._new_atoms[nj].get('kind') == 'block':
-                                            new_li_atoms.append(self._new_atoms[nj])
-                                # Collect old atoms from the end replace too
-                                if s_tag == 'replace':
-                                    for ai in range(s_i1, s_i2):
-                                        if self._old_atoms[ai].get('kind') == 'block':
-                                            old_p_atoms.append(self._old_atoms[ai])
-
-                                if old_p_atoms and new_li_atoms:
-                                    with self.diff_group():
-                                        diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
-
-                                        # Emit hidden <del class="structural-revert-data"> with old <p> events
-                                        revert_events = concat_events(old_p_atoms)
-                                        del_attrs = Attrs([(QName('class'), 'structural-revert-data'),
-                                                           (QName('style'), 'display:none')])
-                                        if diff_id:
-                                            del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
-                                        self.append(START, (QName('del'), del_attrs), (None, -1, -1))
-                                        for ev in revert_events:
-                                            self.append(*ev)
-                                        self.append(END, QName('del'), (None, -1, -1))
-
-                                        # Emit <ol/ul class="tagdiff_added">
-                                        list_qname = list_start_ev[1][0]
-                                        list_attrs = list_start_ev[1][1]
-                                        list_attrs = self.inject_class(list_attrs, 'tagdiff_added')
-                                        if diff_id:
-                                            list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-                                        self.enter(list_start_ev[2], list_qname, list_attrs)
-
-                                        # Build old LI lookup by text key for inner diffing
-                                        from .utils import normalize_style_value
-                                        old_li_by_text = {}
-                                        for oatom in old_p_atoms:
-                                            oevs = oatom.get('events', [])
-                                            if oevs and oevs[0][0] == START and qname_localname(oevs[0][1][0]) == 'li':
-                                                otxt = ''.join(e[1] for e in oevs if e[0] == TEXT).strip()
-                                                old_li_by_text[otxt] = oevs
-
-                                        # Emit each <li class="diff-bullet-ins">
-                                        for li_atom in new_li_atoms:
-                                            li_evs = li_atom.get('events', [])
-                                            if li_evs and li_evs[0][0] == START:
-                                                li_tag = li_evs[0][1][0]
-                                                li_attrs = li_evs[0][1][1]
-                                                li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
-
-                                                # Check for old LI match by text
-                                                new_txt = ''.join(e[1] for e in li_evs if e[0] == TEXT).strip()
-                                                old_li_evs = old_li_by_text.get(new_txt)
-                                                if old_li_evs:
-                                                    old_li_attrs = old_li_evs[0][1][1]
-                                                    li_attrs = self.inject_refattr(li_attrs, old_li_attrs)
-                                                    li_style_changed = (old_li_attrs != li_evs[0][1][1])
-                                                else:
-                                                    li_style_changed = False
-
-                                                if diff_id:
-                                                    li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-                                                self.enter(li_evs[0][2], li_tag, li_attrs)
-
-                                                if li_style_changed and old_li_evs:
-                                                    # LI style changed: inline del(old)/ins
-                                                    old_style_val = old_li_attrs.get('style')
-                                                    with self.diff_group():
-                                                        del_tag_attrs = Attrs()
-                                                        if old_style_val:
-                                                            del_tag_attrs = del_tag_attrs | [(QName('style'), old_style_val)]
-                                                        if diff_id:
-                                                            del_tag_attrs = del_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
-                                                        self.append(START, (QName('del'), del_tag_attrs), (None, -1, -1))
-                                                        for ev in old_li_evs[1:-1]:
-                                                            self.append(*ev)
-                                                        self.append(END, QName('del'), (None, -1, -1))
-                                                        ins_tag_attrs = Attrs()
-                                                        if diff_id:
-                                                            ins_tag_attrs = ins_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
-                                                        self.append(START, (QName('ins'), ins_tag_attrs), (None, -1, -1))
-                                                        for ev in li_evs[1:-1]:
-                                                            self.append(*ev)
-                                                        self.append(END, QName('ins'), (None, -1, -1))
-                                                elif old_li_evs and old_li_evs[1:-1] != li_evs[1:-1]:
-                                                    # Inner content changed (e.g. <i> wrapper added): use EventDiffer
-                                                    inner = _EventDiffer(old_li_evs[1:-1], li_evs[1:-1], self.config, diff_id_state=self._diff_id_state)
-                                                    for ev in inner.get_diff_events():
-                                                        self.append(*ev)
-                                                else:
-                                                    for ev in li_evs[1:-1]:
-                                                        self.append(*ev)
-                                                self.leave(li_evs[-1][2], li_evs[-1][1])
-
-                                        # Close ol/ul
-                                        self.leave(end_ev[2], end_ev[1])
-
-                                    k = scan_k + 1
-                                    found_structural = True
-                                    break
+                                found_structural = True
+                                scan_k += 1
                             break
+                        elif s_tag == 'delete':
+                            # Old-side only deletion — might be trailing old <p> in the middle
+                            # Skip it and continue scanning
+                            bullet_equal_ranges.append((scan_k, s_tag, s_i1, s_i2, s_j1, s_j2))
+                            scan_k += 1
+                            continue
                         else:
                             break
+
+                    if found_structural and bullet_equal_ranges:
+                        # Found complete pattern! Emit structural list diff.
+                        old_p_atoms = []
+                        new_li_atoms = []
+                        # Collect old atoms from the initial replace (e.g. deleted <p> </p>)
+                        if tag == 'replace':
+                            for ai in range(i1, i2):
+                                if self._old_atoms[ai].get('kind') == 'block':
+                                    old_p_atoms.append(self._old_atoms[ai])
+                        for _, _, eq_i1, eq_i2, eq_j1, eq_j2 in bullet_equal_ranges:
+                            for ai in range(eq_i1, eq_i2):
+                                if self._old_atoms[ai].get('kind') == 'block':
+                                    old_p_atoms.append(self._old_atoms[ai])
+                            for nj in range(eq_j1, eq_j2):
+                                if self._new_atoms[nj].get('kind') == 'block':
+                                    new_li_atoms.append(self._new_atoms[nj])
+
+                        if old_p_atoms and new_li_atoms:
+                            with self.diff_group():
+                                diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
+
+                                # Emit hidden <del class="structural-revert-data"> with old <p> events
+                                revert_events = concat_events(old_p_atoms)
+                                del_attrs = Attrs([(QName('class'), 'structural-revert-data'),
+                                                   (QName('style'), 'display:none')])
+                                if diff_id:
+                                    del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+                                self.append(START, (QName('del'), del_attrs), (None, -1, -1))
+                                for ev in revert_events:
+                                    self.append(*ev)
+                                self.append(END, QName('del'), (None, -1, -1))
+
+                                # Emit <ol/ul class="tagdiff_added">
+                                list_qname = list_start_ev[1][0]
+                                list_attrs = list_start_ev[1][1]
+                                list_attrs = self.inject_class(list_attrs, 'tagdiff_added')
+                                if diff_id:
+                                    list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                self.enter(list_start_ev[2], list_qname, list_attrs)
+
+                                # Build old LI lookup by text key for inner diffing
+                                from .utils import normalize_style_value
+                                old_li_by_text = {}
+                                for oatom in old_p_atoms:
+                                    oevs = oatom.get('events', [])
+                                    if oevs and oevs[0][0] == START and qname_localname(oevs[0][1][0]) == 'li':
+                                        otxt = ''.join(e[1] for e in oevs if e[0] == TEXT).strip()
+                                        old_li_by_text[otxt] = oevs
+
+                                # Emit each <li class="diff-bullet-ins">
+                                for li_atom in new_li_atoms:
+                                    li_evs = li_atom.get('events', [])
+                                    if li_evs and li_evs[0][0] == START:
+                                        li_tag = li_evs[0][1][0]
+                                        li_attrs = li_evs[0][1][1]
+                                        li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
+
+                                        # Check for old LI match by text
+                                        new_txt = ''.join(e[1] for e in li_evs if e[0] == TEXT).strip()
+                                        old_li_evs = old_li_by_text.get(new_txt)
+                                        if old_li_evs:
+                                            old_li_attrs = old_li_evs[0][1][1]
+                                            li_attrs = self.inject_refattr(li_attrs, old_li_attrs)
+                                            li_style_changed = (old_li_attrs != li_evs[0][1][1])
+                                        else:
+                                            li_style_changed = False
+
+                                        if diff_id:
+                                            li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                        self.enter(li_evs[0][2], li_tag, li_attrs)
+
+                                        if li_style_changed and old_li_evs:
+                                            # LI style changed: inline del(old)/ins
+                                            old_style_val = old_li_attrs.get('style')
+                                            with self.diff_group():
+                                                del_tag_attrs = Attrs()
+                                                if old_style_val:
+                                                    del_tag_attrs = del_tag_attrs | [(QName('style'), old_style_val)]
+                                                if diff_id:
+                                                    del_tag_attrs = del_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
+                                                self.append(START, (QName('del'), del_tag_attrs), (None, -1, -1))
+                                                for ev in old_li_evs[1:-1]:
+                                                    self.append(*ev)
+                                                self.append(END, QName('del'), (None, -1, -1))
+                                                ins_tag_attrs = Attrs()
+                                                if diff_id:
+                                                    ins_tag_attrs = ins_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
+                                                self.append(START, (QName('ins'), ins_tag_attrs), (None, -1, -1))
+                                                for ev in li_evs[1:-1]:
+                                                    self.append(*ev)
+                                                self.append(END, QName('ins'), (None, -1, -1))
+                                        elif old_li_evs and old_li_evs[1:-1] != li_evs[1:-1]:
+                                            # Inner content changed (e.g. <i> wrapper added): use EventDiffer
+                                            inner = _EventDiffer(old_li_evs[1:-1], li_evs[1:-1], self.config, diff_id_state=self._diff_id_state)
+                                            for ev in inner.get_diff_events():
+                                                self.append(*ev)
+                                        else:
+                                            for ev in li_evs[1:-1]:
+                                                self.append(*ev)
+                                        self.leave(li_evs[-1][2], li_evs[-1][1])
+
+                                # Close ol/ul
+                                self.leave((None, -1, -1), list_qname)
+
+                            k = scan_k
+                            continue
                     if found_structural:
                         continue
 

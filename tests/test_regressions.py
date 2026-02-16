@@ -2078,3 +2078,89 @@ def test_ol_font_added_del_uses_initial():
     for s in del_styles:
         assert 'font-family: initial' in s, f"del should have font-family: initial, got: {s}"
         assert 'Comic' not in s, f"del should NOT have Comic Sans, got: {s}"
+
+
+def test_p_to_ul_structural_diff_full_case():
+    """When multiple <p> blocks (some with <br/> separators) are converted to a
+    <ul> with individual <li> items, the diff should use structural detection:
+    - All <li> items get diff-bullet-ins (green bullets)
+    - No duplicate del/ins for identical text
+    - <ul> gets tagdiff_added
+    - </ul> closes before trailing content (Conclusiones, etc.)
+    """
+    old = (
+        '<p><strong>Indicación médica.</strong><br/><strong>Tomografía simple de abdomen y pelvis. </strong><br/><strong>Comparación:</strong></p>'
+        '<br/>'
+        '<p><strong>Hallazgos:</strong></p>'
+        '<p>Bases pulmonares .</p>'
+        '<p>Unión gastroesofágica en situación infradiafragmática.<br/>Estómago sin engrosamiento mural. <br/>Asas de intestino delgado con distribución y diámetro normal. Apéndice cecal sin alteraciones. El colon de diámetro normal, conserva el patrón de las haustras.</p>'
+        '<p>Hígado de tamaño normal con contornos lisos y atenuación homogénea en la fase simple.<br/>Vía biliar sin dilatación. <br/>Vesícula biliar de pared delgada con contenido hipodenso, homogéneo.</p>'
+        '<p>Bazo, páncreas y adrenales sin alteraciones.</p>'
+        '<p>Riñones de tamaño normal con contornos lisos. Sistemas colectores de amplitud normal. Grasa perirrenal sin alteraciones.<br/>Vejiga poco distendida con contenido hipodenso, homogéneo. </p>'
+        '<p>Aorta abdominal y vena cava inferior con diámetros normales. <br/>Mesenterio y retroperitoneo con densidad normal.<br/>Ganglios linfáticos mesentéricos y retroperitoneales de características normales.</p>'
+        '<p>Tejidos blandos.<br/>Los cuerpos vertebrales conservan su altura y alineación. Densidad ósea de aspecto normal.</p>'
+        '<br/>'
+        '<p><strong>Conclusiones:</strong></p>'
+        '<p>Resto referido en la descripción.</p>'
+    )
+    new = (
+        '<p><strong>Indicación médica.</strong><br/><strong>Tomografía simple de abdomen y pelvis. </strong><br/><strong>Comparación:</strong></p>'
+        '<br/>'
+        '<p><strong>Hallazgos:</strong></p>'
+        '<ul>'
+        '<li>Bases pulmonares .</li>'
+        '<li>Unión gastroesofágica en situación infradiafragmática.</li>'
+        '<li>Estómago sin engrosamiento mural. </li>'
+        '<li>Asas de intestino delgado con distribución y diámetro normal.</li>'
+        '<li>Apéndice cecal sin alteraciones.</li>'
+        '<li>El colon de diámetro normal, conserva el patrón de las haustras.</li>'
+        '<li>Hígado de tamaño normal con contornos lisos y atenuación homogénea en la fase simple.</li>'
+        '<li>Vía biliar sin dilatación. </li>'
+        '<li>Vesícula biliar de pared delgada con contenido hipodenso, homogéneo.</li>'
+        '<li>Bazo, páncreas y adrenales sin alteraciones.</li>'
+        '<li>Riñones de tamaño normal con contornos lisos.</li>'
+        '<li>Sistemas colectores de amplitud normal.</li>'
+        '<li>Grasa perirrenal sin alteraciones.</li>'
+        '<li>Vejiga poco distendida con contenido hipodenso, homogéneo. </li>'
+        '<li>Aorta abdominal y vena cava inferior con diámetros normales. </li>'
+        '<li>Mesenterio y retroperitoneo con densidad normal.</li>'
+        '<li>Ganglios linfáticos mesentéricos y retroperitoneales de características normales.</li>'
+        '<li>Tejidos blandos.</li>'
+        '<li>Los cuerpos vertebrales conservan su altura y alineación. Densidad ósea de aspecto normal.</li>'
+        '</ul>'
+        '<br/>'
+        '<p><strong>Conclusiones:</strong></p>'
+        '<p>Resto referido en la descripción.</p>'
+    )
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Strip hidden revert data
+    visible = re.sub(r'<del class="(del|structural-revert-data)"[^>]*style="display:none"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+
+    # All 19 li items should have diff-bullet-ins
+    bullet_count = visible.count('diff-bullet-ins')
+    assert bullet_count == 19, f"Expected 19 diff-bullet-ins, got {bullet_count}"
+
+    # ul should have tagdiff_added
+    assert 'tagdiff_added' in visible, "ul should have tagdiff_added"
+
+    # No tagdiff_deleted markers
+    assert 'tagdiff_deleted' not in visible, "Should NOT have tagdiff_deleted"
+
+    # No duplicate del/ins for identical text
+    pairs = re.findall(r'<del[^>]*>(.*?)</del>.*?<ins[^>]*>(.*?)</ins>', visible, flags=re.DOTALL)
+    for d, i in pairs:
+        dc = re.sub(r'<[^>]+>', '', d).strip()
+        ic = re.sub(r'<[^>]+>', '', i).strip()
+        assert dc != ic or not dc, f"Duplicate del/ins for identical text: '{dc[:60]}'"
+
+    # "Conclusiones" should appear OUTSIDE the <ul> (after </ul>)
+    ul_end = visible.find('</ul>')
+    conclusiones_pos = visible.find('Conclusiones')
+    assert ul_end != -1, "</ul> should be present"
+    assert conclusiones_pos != -1, "Conclusiones should be present"
+    assert conclusiones_pos > ul_end, "Conclusiones should appear after </ul>"
+
