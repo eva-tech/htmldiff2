@@ -2164,3 +2164,73 @@ def test_p_to_ul_structural_diff_full_case():
     assert conclusiones_pos != -1, "Conclusiones should be present"
     assert conclusiones_pos > ul_end, "Conclusiones should appear after </ul>"
 
+
+def test_p_to_ul_structural_diff_spelling_corrections():
+    """Single-opcode p→ul structural diff with spelling corrections shows inline del/ins."""
+    old = (
+        '<p><strong>Indicación médica.</strong><br/><strong>Tomografía simple de abdomen y pelvis. </strong><br/><strong>Comparación:</strong></p>'
+        '<br/>'
+        '<p><strong>Hallazgos:</strong></p>'
+        '<p>Bases pulmonares .</p>'
+        '<p>Unión gastroesofágica en situación infradiafragmática.<br/>Estómago sin engrosamiento mural. <br/>Asas de intestino delgado con distribución y diámetro normal. Apéndice cecal sin alteraciones. El colon de diámetro normal, conserva el patrón de las haustras.</p>'
+        '<p>Hígado de tamaño normal con contornos lisos y atenuación homogénea en la fase simple.<br/>Vía biliar sin dilatación. <br/>Vesícula biliar de pared delgada con contenido hipodesnso, homogéneo.</p>'
+        '<p>Bazo, páncreas y adrenales sin alteracones.</p>'
+        '<p>Riñones de tamaño normal con contornos lisos. Sistemas colectores de amplitud normal. Grasa perirrenal sin alteraciones.<br/>Vejiga poco distendida con contenido hipodenso, homogéneo. </p>'
+        '<p>Aorta abdominal y vena cava inferior con diámetros normales. <br/>Mesenterio y retroperitoneo con densidad normall.<br/>Ganglios linfáticos mesentéricos y retroperitoneales de características normales.</p>'
+        '<p>Tejidos blandos.<br/>Los cuerpos vertebrales conservan su altura y alineación. Densidad ósea de aspecto normal.</p>'
+        '<br/>'
+        '<p><strong>Conclusiones:</strong></p>'
+        '<p>Resto referido en la descripción.</p>'
+        '<br/><br/><br/>'
+    )
+    new = (
+        '<p><strong>Indicación médica.</strong><br/><strong>Tomografía simple de abdomen y pelvis. </strong><br/><strong>Comparación:</strong></p>'
+        '<br/>'
+        '<p><strong>Hallazgos:</strong></p>'
+        '<ul>'
+        '<li>Bases pulmonares sin alteraciones significativas.</li>'
+        '<li>Unión gastroesofágica en situación infradiafragmática.</li>'
+        '<li>Estómago sin engrosamiento mural.</li>'
+        '<li>Asas de intestino delgado con distribución y diámetro normal.</li>'
+        '<li>Apéndice cecal sin alteraciones.</li>'
+        '<li>El colon de diámetro normal, conserva el patrón de las haustras.</li>'
+        '<li>Hígado de tamaño normal con contornos lisos y atenuación homogénea en la fase simple.</li>'
+        '<li>Vía biliar sin dilatación.</li>'
+        '<li>Vesícula biliar de pared delgada con contenido hipodenso, homogéneo.</li>'
+        '<li>Bazo, páncreas y adrenales sin alteraciones.</li>'
+        '<li>Riñones de tamaño normal con contornos lisos. Sistemas colectores de amplitud normal. Grasa perirrenal sin alteraciones.</li>'
+        '<li>Vejiga poco distendida con contenido hipodenso, homogéneo.</li>'
+        '<li>Aorta abdominal y vena cava inferior con diámetros normales.</li>'
+        '<li>Mesenterio y retroperitoneo con densidad normal.</li>'
+        '<li>Ganglios linfáticos mesentéricos y retroperitoneales de características normales.</li>'
+        '<li>Tejidos blandos sin alteraciones significativas.</li>'
+        '<li>Los cuerpos vertebrales conservan su altura y alineación. Densidad ósea de aspecto normal.</li>'
+        '</ul>'
+        '<br/>'
+        '<p><strong>Conclusiones:</strong></p>'
+        '<p>Estudio dentro de límites normales para la edad y sexo del paciente.</p>'
+        '<br/><br/><br/>'
+    )
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Strip hidden revert data
+    visible = re.sub(r'<del class="(del|structural-revert-data)"[^>]*style="display:none"[^>]*>.*?</del>', '', out, flags=re.DOTALL)
+
+    # Should have diff-bullet-ins (structural detection fired)
+    bullet_count = visible.count('diff-bullet-ins')
+    assert bullet_count == 17, f"Expected 17 diff-bullet-ins, got {bullet_count}"
+
+    # ul should have tagdiff_added
+    assert 'tagdiff_added' in visible, "ul should have tagdiff_added"
+
+    # Spelling corrections should appear in del tags (inline del/ins)
+    assert 'hipodesnso' in visible, "Old spelling 'hipodesnso' should appear in del"
+    assert 'alteracones' in visible, "Old spelling 'alteracones' should appear in del"
+    assert 'normall' in visible, "Old spelling 'normall' should appear in del"
+
+    # The corrected text should appear in ins tags
+    assert '<ins' in visible and 'hipodenso' in visible, "hipodenso should be in visible"
+

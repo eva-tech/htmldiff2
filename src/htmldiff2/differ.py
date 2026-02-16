@@ -842,11 +842,47 @@ class StreamDiffer(object):
                             break
 
                 if list_tag:
-                    # Look ahead: find equal(p↔li) blocks followed by insert(...END ol/ul)
-                    bullet_equal_ranges = []
-                    scan_k = k + 1
-                    found_structural = False
-                    while scan_k < len(opcodes):
+                    # Check if this single opcode contains the entire list structure
+                    # (START, li blocks, END) — happens when text differs and SequenceMatcher
+                    # puts everything in one big replace.
+                    single_opcode_structural = False
+                    if tag == 'replace':
+                        # Check if ul END is also in the new range of this opcode
+                        has_end = False
+                        has_li = False
+                        for nj in range(j1, j2):
+                            a = self._new_atoms[nj]
+                            evs = a.get('events', [])
+                            if a.get('kind') == 'block' and a.get('tag') == 'li':
+                                has_li = True
+                            elif (a.get('kind') == 'event' and len(evs) == 1
+                                    and evs[0][0] == END
+                                    and qname_localname(evs[0][1]) == list_tag):
+                                has_end = True
+                        if has_li and has_end:
+                            # Check old side has p blocks
+                            has_old_p = any(
+                                self._old_atoms[ai].get('kind') == 'block' and self._old_atoms[ai].get('tag') == 'p'
+                                for ai in range(i1, i2)
+                            )
+                            if has_old_p:
+                                single_opcode_structural = True
+
+                    if single_opcode_structural:
+                        # Entire list structure is within this single replace opcode
+                        old_p_atoms = [self._old_atoms[ai] for ai in range(i1, i2)
+                                       if self._old_atoms[ai].get('kind') == 'block' and self._old_atoms[ai].get('tag') == 'p']
+                        new_li_atoms = [self._new_atoms[nj] for nj in range(j1, j2)
+                                        if self._new_atoms[nj].get('kind') == 'block' and self._new_atoms[nj].get('tag') == 'li']
+                        found_structural = True
+                        scan_k = k + 1
+                        bullet_equal_ranges = [('self', tag, i1, i2, j1, j2)]
+                    else:
+                        # Look ahead: find equal(p↔li) blocks followed by insert(...END ol/ul)
+                        bullet_equal_ranges = []
+                        scan_k = k + 1
+                        found_structural = False
+                    while not found_structural and scan_k < len(opcodes):
                         s_tag, s_i1, s_i2, s_j1, s_j2 = opcodes[scan_k]
                         if s_tag in ('equal', 'replace'):
                             # Check old=p blocks (or text), new=li blocks (or text)
@@ -918,8 +954,8 @@ class StreamDiffer(object):
                         else:
                             break
 
-                    if found_structural and bullet_equal_ranges:
-                        # Found complete pattern! Emit structural list diff.
+                    if found_structural and not single_opcode_structural:
+                        # Collect atoms from multi-opcode pattern
                         old_p_atoms = []
                         new_li_atoms = []
                         # Collect old atoms from the initial replace (e.g. deleted <p> </p>)
@@ -935,95 +971,179 @@ class StreamDiffer(object):
                                 if self._new_atoms[nj].get('kind') == 'block':
                                     new_li_atoms.append(self._new_atoms[nj])
 
-                        if old_p_atoms and new_li_atoms:
-                            with self.diff_group():
-                                diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
+                    if found_structural and old_p_atoms and new_li_atoms:
+                        with self.diff_group():
+                            diff_id = self._new_diff_id() if getattr(self.config, 'add_diff_ids', False) else None
 
-                                # Emit hidden <del class="structural-revert-data"> with old <p> events
-                                revert_events = concat_events(old_p_atoms)
-                                del_attrs = Attrs([(QName('class'), 'structural-revert-data'),
-                                                   (QName('style'), 'display:none')])
-                                if diff_id:
-                                    del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
-                                self.append(START, (QName('del'), del_attrs), (None, -1, -1))
-                                for ev in revert_events:
-                                    self.append(*ev)
-                                self.append(END, QName('del'), (None, -1, -1))
+                            # Emit hidden <del class="structural-revert-data"> with old <p> events
+                            revert_events = concat_events(old_p_atoms)
+                            del_attrs = Attrs([(QName('class'), 'structural-revert-data'),
+                                               (QName('style'), 'display:none')])
+                            if diff_id:
+                                del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), diff_id)]
+                            self.append(START, (QName('del'), del_attrs), (None, -1, -1))
+                            for ev in revert_events:
+                                self.append(*ev)
+                            self.append(END, QName('del'), (None, -1, -1))
 
-                                # Emit <ol/ul class="tagdiff_added">
-                                list_qname = list_start_ev[1][0]
-                                list_attrs = list_start_ev[1][1]
-                                list_attrs = self.inject_class(list_attrs, 'tagdiff_added')
-                                if diff_id:
-                                    list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-                                self.enter(list_start_ev[2], list_qname, list_attrs)
+                            # Emit <ol/ul class="tagdiff_added">
+                            list_qname = list_start_ev[1][0]
+                            list_attrs = list_start_ev[1][1]
+                            list_attrs = self.inject_class(list_attrs, 'tagdiff_added')
+                            if diff_id:
+                                list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                            self.enter(list_start_ev[2], list_qname, list_attrs)
 
-                                # Build old LI lookup by text key for inner diffing
-                                from .utils import normalize_style_value
-                                old_li_by_text = {}
-                                for oatom in old_p_atoms:
-                                    oevs = oatom.get('events', [])
-                                    if oevs and oevs[0][0] == START and qname_localname(oevs[0][1][0]) == 'li':
-                                        otxt = ''.join(e[1] for e in oevs if e[0] == TEXT).strip()
-                                        old_li_by_text[otxt] = oevs
+                            # Build old sentence lookup for inner diffing.
+                            # Extract text from old p atoms (splitting multi-sentence <p> at <br/>)
+                            # Also support old <li> atoms (for same-list-type structural diffs).
+                            from .utils import normalize_style_value
+                            old_sentences = []  # [(text, events_list), ...]
+                            for oatom in old_p_atoms:
+                                oevs = oatom.get('events', [])
+                                if not oevs:
+                                    continue
+                                otag = oatom.get('tag')
+                                if otag == 'li':
+                                    # Old li atom: use directly
+                                    otxt = ''.join(e[1] for e in oevs if e[0] == TEXT).strip()
+                                    if otxt:
+                                        old_sentences.append((otxt, oevs))
+                                elif otag == 'p':
+                                    # Old p atom: split at <br/> boundaries into sentences
+                                    # Each segment between br tags is a potential sentence
+                                    current_texts = []
+                                    for ev in oevs:
+                                        if ev[0] == TEXT:
+                                            current_texts.append(ev[1])
+                                        elif ev[0] == START and qname_localname(ev[1][0]) == 'br':
+                                            # Flush current sentence
+                                            stxt = ''.join(current_texts).strip()
+                                            if stxt:
+                                                old_sentences.append((stxt, None))
+                                            current_texts = []
+                                        elif ev[0] == END and qname_localname(ev[1]) == 'br':
+                                            pass  # skip br end
+                                    # Flush last segment
+                                    stxt = ''.join(current_texts).strip()
+                                    if stxt:
+                                        old_sentences.append((stxt, None))
 
-                                # Emit each <li class="diff-bullet-ins">
-                                for li_atom in new_li_atoms:
-                                    li_evs = li_atom.get('events', [])
-                                    if li_evs and li_evs[0][0] == START:
-                                        li_tag = li_evs[0][1][0]
-                                        li_attrs = li_evs[0][1][1]
-                                        li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
+                            # Pre-compute matches: li_index → old_sentence_text
+                            from difflib import SequenceMatcher as SM
+                            li_texts = []
+                            for li_atom in new_li_atoms:
+                                li_evs = li_atom.get('events', [])
+                                txt = ''.join(e[1] for e in li_evs if e[0] == TEXT).strip()
+                                li_texts.append(txt)
 
-                                        # Check for old LI match by text
-                                        new_txt = ''.join(e[1] for e in li_evs if e[0] == TEXT).strip()
-                                        old_li_evs = old_li_by_text.get(new_txt)
-                                        if old_li_evs:
-                                            old_li_attrs = old_li_evs[0][1][1]
-                                            li_attrs = self.inject_refattr(li_attrs, old_li_attrs)
-                                            li_style_changed = (old_li_attrs != li_evs[0][1][1])
-                                        else:
-                                            li_style_changed = False
+                            old_used = set()
+                            li_matched = {}  # li_index → old_sentence_text
 
-                                        if diff_id:
-                                            li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-                                        self.enter(li_evs[0][2], li_tag, li_attrs)
+                            # Pass 1: near-exact matches (ratio >= 0.95)
+                            for li_idx, ntxt in enumerate(li_texts):
+                                best_idx, best_ratio, best_txt = None, 0.0, None
+                                for oi, (otxt, _) in enumerate(old_sentences):
+                                    if oi in old_used:
+                                        continue
+                                    r = SM(None, otxt.lower(), ntxt.lower()).ratio()
+                                    if r > best_ratio:
+                                        best_ratio, best_idx, best_txt = r, oi, otxt
+                                if best_idx is not None and best_ratio >= 0.95:
+                                    old_used.add(best_idx)
+                                    if best_txt.strip() != ntxt.strip():
+                                        li_matched[li_idx] = best_txt
 
-                                        if li_style_changed and old_li_evs:
-                                            # LI style changed: inline del(old)/ins
-                                            old_style_val = old_li_attrs.get('style')
-                                            with self.diff_group():
-                                                del_tag_attrs = Attrs()
-                                                if old_style_val:
-                                                    del_tag_attrs = del_tag_attrs | [(QName('style'), old_style_val)]
-                                                if diff_id:
-                                                    del_tag_attrs = del_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
-                                                self.append(START, (QName('del'), del_tag_attrs), (None, -1, -1))
-                                                for ev in old_li_evs[1:-1]:
-                                                    self.append(*ev)
-                                                self.append(END, QName('del'), (None, -1, -1))
-                                                ins_tag_attrs = Attrs()
-                                                if diff_id:
-                                                    ins_tag_attrs = ins_tag_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), self._new_diff_id())]
-                                                self.append(START, (QName('ins'), ins_tag_attrs), (None, -1, -1))
-                                                for ev in li_evs[1:-1]:
-                                                    self.append(*ev)
-                                                self.append(END, QName('ins'), (None, -1, -1))
-                                        elif old_li_evs and old_li_evs[1:-1] != li_evs[1:-1]:
-                                            # Inner content changed (e.g. <i> wrapper added): use EventDiffer
-                                            inner = _EventDiffer(old_li_evs[1:-1], li_evs[1:-1], self.config, diff_id_state=self._diff_id_state)
-                                            for ev in inner.get_diff_events():
-                                                self.append(*ev)
-                                        else:
-                                            for ev in li_evs[1:-1]:
-                                                self.append(*ev)
-                                        self.leave(li_evs[-1][2], li_evs[-1][1])
+                            # Pass 2: spelling correction matches (ratio >= 0.5)
+                            # with length guard to reject multi-sentence → single sentence matches
+                            for li_idx, ntxt in enumerate(li_texts):
+                                if li_idx in li_matched or ntxt in [otxt for oi, (otxt, _) in enumerate(old_sentences) if oi in old_used]:
+                                    continue
+                                best_idx, best_ratio, best_txt = None, 0.0, None
+                                nword_count = len(ntxt.split())
+                                for oi, (otxt, _) in enumerate(old_sentences):
+                                    if oi in old_used:
+                                        continue
+                                    # Skip if old sentence has >1.5x words (multi-sentence block)
+                                    if len(otxt.split()) > nword_count * 1.5:
+                                        continue
+                                    r = SM(None, otxt.lower(), ntxt.lower()).ratio()
+                                    if r > best_ratio:
+                                        best_ratio, best_idx, best_txt = r, oi, otxt
+                                if best_idx is not None and best_ratio >= 0.5:
+                                    old_used.add(best_idx)
+                                    if best_txt.strip() != ntxt.strip():
+                                        li_matched[li_idx] = best_txt
 
-                                # Close ol/ul
-                                self.leave((None, -1, -1), list_qname)
+                            # Emit each <li class="diff-bullet-ins">
+                            for li_idx, li_atom in enumerate(new_li_atoms):
+                                li_evs = li_atom.get('events', [])
+                                if li_evs and li_evs[0][0] == START:
+                                    li_tag = li_evs[0][1][0]
+                                    li_attrs = li_evs[0][1][1]
+                                    li_attrs = self.inject_class(li_attrs, 'diff-bullet-ins')
 
-                            k = scan_k
-                            continue
+                                    new_txt = li_texts[li_idx]
+                                    matched_old = li_matched.get(li_idx)
+
+                                    if diff_id:
+                                        li_attrs = self._set_attr(li_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
+                                    self.enter(li_evs[0][2], li_tag, li_attrs)
+
+                                    if matched_old:
+                                        # Text changed (spelling fix, additions, etc.)
+                                        # Emit word-level inline del/ins
+                                        old_words = matched_old.split()
+                                        new_words = new_txt.split()
+                                        sm = SM(None, old_words, new_words)
+                                        with self.diff_group():
+                                            for wop, wi1, wi2, wj1, wj2 in sm.get_opcodes():
+                                                if wop == 'equal':
+                                                    self.append(TEXT, ' '.join(new_words[wj1:wj2]) + ' ', (None, -1, -1))
+                                                elif wop == 'replace':
+                                                    del_inner_id = self._new_diff_id() if diff_id else None
+                                                    del_a = Attrs()
+                                                    if del_inner_id:
+                                                        del_a = del_a | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), del_inner_id)]
+                                                    self.append(START, (QName('del'), del_a), (None, -1, -1))
+                                                    self.append(TEXT, ' '.join(old_words[wi1:wi2]), (None, -1, -1))
+                                                    self.append(END, QName('del'), (None, -1, -1))
+                                                    ins_a = Attrs()
+                                                    if del_inner_id:
+                                                        ins_a = ins_a | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), del_inner_id)]
+                                                    self.append(START, (QName('ins'), ins_a), (None, -1, -1))
+                                                    self.append(TEXT, ' '.join(new_words[wj1:wj2]), (None, -1, -1))
+                                                    self.append(END, QName('ins'), (None, -1, -1))
+                                                    self.append(TEXT, ' ', (None, -1, -1))
+                                                elif wop == 'delete':
+                                                    del_inner_id = self._new_diff_id() if diff_id else None
+                                                    del_a = Attrs()
+                                                    if del_inner_id:
+                                                        del_a = del_a | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), del_inner_id)]
+                                                    self.append(START, (QName('del'), del_a), (None, -1, -1))
+                                                    self.append(TEXT, ' '.join(old_words[wi1:wi2]), (None, -1, -1))
+                                                    self.append(END, QName('del'), (None, -1, -1))
+                                                    self.append(TEXT, ' ', (None, -1, -1))
+                                                elif wop == 'insert':
+                                                    ins_inner_id = self._new_diff_id() if diff_id else None
+                                                    ins_a = Attrs()
+                                                    if ins_inner_id:
+                                                        ins_a = ins_a | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), ins_inner_id)]
+                                                    self.append(START, (QName('ins'), ins_a), (None, -1, -1))
+                                                    self.append(TEXT, ' '.join(new_words[wj1:wj2]), (None, -1, -1))
+                                                    self.append(END, QName('ins'), (None, -1, -1))
+                                                    self.append(TEXT, ' ', (None, -1, -1))
+                                    else:
+                                        # No change or no match — emit text as-is
+                                        for ev in li_evs[1:-1]:
+                                            self.append(*ev)
+                                    self.leave(li_evs[-1][2], li_evs[-1][1])
+
+                            # Close ol/ul
+                            self.leave((None, -1, -1), list_qname)
+
+                        k = scan_k
+                        continue
                     if found_structural:
                         continue
 
