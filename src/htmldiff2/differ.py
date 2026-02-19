@@ -1529,12 +1529,30 @@ class StreamDiffer(object):
                                                     self.leave(end_ev_atoms[0][2], end_ev_atoms[0][1])
 
                                             # Skip all consumed opcodes
+                                            # but preserve any trailing atoms that extend past the list end
+                                            tail_old_start = None
+                                            tail_new_start = None
+                                            tail_tag = None
                                             while k + 1 < len(opcodes):
                                                 next_tag, next_i1, next_i2, next_j1, next_j2 = opcodes[k + 1]
                                                 if next_i1 <= end_idx_old or next_j1 <= end_idx_new:
+                                                    # This opcode overlaps with the list — check if it extends past
+                                                    if next_i2 > end_idx_old + 1 or next_j2 > end_idx_new + 1:
+                                                        # Opcode extends past the list end — save tail boundaries
+                                                        tail_old_start = max(next_i1, end_idx_old + 1)
+                                                        tail_new_start = max(next_j1, end_idx_new + 1)
+                                                        tail_tag = next_tag
+                                                        tail_old_end = next_i2
+                                                        tail_new_end = next_j2
                                                     k += 1
                                                 else:
                                                     break
+
+                                            # Emit any trailing atoms from the partially-consumed opcode
+                                            if tail_old_start is not None and tail_tag == 'equal':
+                                                tail_old_atoms = self._old_atoms[tail_old_start:tail_old_end]
+                                                tail_new_atoms = self._new_atoms[tail_new_start:tail_new_end]
+                                                self._process_equal_opcode(tail_old_atoms, tail_new_atoms)
                                             k += 1
                                             continue
 

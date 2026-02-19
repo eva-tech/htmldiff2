@@ -2234,3 +2234,44 @@ def test_p_to_ul_structural_diff_spelling_corrections():
     # The corrected text should appear in ins tags
     assert '<ins' in visible and 'hipodenso' in visible, "hipodenso should be in visible"
 
+
+def test_ol_style_change_preserves_following_table():
+    """Table after <ol> with style change must not disappear from output."""
+    old = (
+        '<div><div>'
+        '<h2><strong>ESTUDIO</strong></h2>'
+        '<ol>'
+        '<li><strong>Item 1:</strong> Normal.</li>'
+        '<li><strong>Item 2:</strong> Fractura.</li>'
+        '</ol>'
+        '<table border="1"><tbody>'
+        '<tr><th>Prioridad</th><th>Medición</th></tr>'
+        '<tr><td>1</td><td>No especificada</td></tr>'
+        '</tbody></table>'
+        '</div></div>'
+    )
+    new = (
+        '<div><div>'
+        '<h2 style="font-size: larger;"><strong>ESTUDIO</strong></h2>'
+        '<ol style="font-size: larger;">'
+        '<li><strong>Item 1:</strong> Normal.</li>'
+        '<li><strong>Item 2:</strong> Fractura.</li>'
+        '</ol>'
+        '<table border="1" style="font-size: larger;"><tbody>'
+        '<tr><th>Prioridad</th><th>Medición</th></tr>'
+        '<tr><td>1</td><td>No especificada</td></tr>'
+        '</tbody></table>'
+        '</div></div>'
+    )
+
+    cfg = DiffConfig()
+    cfg.add_diff_ids = True
+    out = htmldiff2.render_html_diff(old, new, config=cfg)
+
+    # Table must be in output
+    assert '<table' in out, "Table tag should be present in output"
+    assert 'Prioridad' in out, "Table content 'Prioridad' should be in output"
+    assert 'Medición' in out, "Table content 'Medición' should be in output"
+
+    # Closing divs must be present
+    assert out.count('</div>') >= 2, "Closing </div> tags should be present"
