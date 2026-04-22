@@ -861,11 +861,18 @@ class StreamDiffer(object):
                                 has_end = True
                         if has_li and has_end:
                             # Check old side has p blocks
-                            has_old_p = any(
-                                self._old_atoms[ai].get('kind') == 'block' and self._old_atoms[ai].get('tag') == 'p'
-                                for ai in range(i1, i2)
+                            old_p_count = sum(
+                                1 for ai in range(i1, i2)
+                                if self._old_atoms[ai].get('kind') == 'block' and self._old_atoms[ai].get('tag') == 'p'
                             )
-                            if has_old_p:
+                            # Reject if new side has non-list block elements (h2, p, etc.)
+                            # exceeding old p count — indicates mixed content, not a pure p→ul conversion
+                            new_non_list_blocks = sum(
+                                1 for nj in range(j1, j2)
+                                if self._new_atoms[nj].get('kind') == 'block'
+                                and self._new_atoms[nj].get('tag') not in ('li',)
+                            )
+                            if old_p_count > 0 and new_non_list_blocks <= old_p_count:
                                 single_opcode_structural = True
 
                     if single_opcode_structural:

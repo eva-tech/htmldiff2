@@ -2275,3 +2275,41 @@ def test_ol_style_change_preserves_following_table():
 
     # Closing divs must be present
     assert out.count('</div>') >= 2, "Closing </div> tags should be present"
+
+
+def test_empty_p_replaced_by_mixed_content_not_truncated():
+    """Single empty <p> replaced by large doc with h2, p, ul, ol must not truncate to a single list."""
+    old = '<p class="p1"><strong> </strong></p>'
+    new = (
+        '<h2><strong>ANGIOTOMOGRAFÍA DE AORTA</strong></h2> <br/> '
+        '<p><strong>INFORMACIÓN CLÍNICA:</strong></p> '
+        '<p>Paciente de 90 años, mujer.</p> <br/> '
+        '<p><strong>HALLAZGOS:</strong></p> '
+        '<p><strong>Sistema Vascular:</strong></p> '
+        '<ul> '
+        '<li><strong>Troncos Supraaórticos:</strong> Variante anatómica.</li> '
+        '<li><strong>Aorta Torácica:</strong> Placas de aterosclerosis.</li> '
+        '</ul> '
+        '<p><strong>Pulmones:</strong></p> '
+        '<ul> '
+        '<li>Enfisema subyacente.</li> '
+        '<li>Bronquiectasias aisladas.</li> '
+        '</ul> '
+        '<p><strong>IMPRESIÓN:</strong></p> '
+        '<ol> '
+        '<li>Aterosclerosis significativa.</li> '
+        '<li>Hipertensión pulmonar.</li> '
+        '</ol> '
+        '<p>Se recomienda correlación clínica.</p>'
+    )
+
+    out = htmldiff2.render_html_diff(old, new)
+
+    # All major content sections must be present (not truncated)
+    assert '<h2' in out, "<h2> heading should be present"
+    assert 'ANGIOTOMOGRAF' in out, "Title text should be present"
+    assert 'HALLAZGOS' in out, "HALLAZGOS section should be present"
+    assert '<ol' in out, "<ol> should be present"
+    assert '<ul' in out, "<ul> should be present"
+    assert 'Se recomienda' in out, "Concluding paragraph should be present"
+    assert 'Pulmones' in out, "Pulmones section header should be present"
