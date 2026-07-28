@@ -12,7 +12,8 @@ from .utils import (
     extract_text_from_events, raw_text_from_events, concat_events,
     longest_common_prefix_len, longest_common_suffix_len,
     has_visual_attrs, attrs_signature, structure_signature,
-    merge_adjacent_change_tags, events_equal_normalized
+    merge_adjacent_change_tags, events_equal_normalized,
+    normalize_void_element_events
 )
 from .atomization import atomize_events
 from .normalization import (
@@ -351,6 +352,33 @@ class StreamDiffer(object):
         self._stack.append(tag)
         self.append(START, (tag, attrs), pos)
 
+    def _strip_change_markers(self, events, drop, unwrap):
+        """
+        Reduce an already-diffed event stream to one side of the change:
+        remove `drop` marker subtrees entirely and unwrap `unwrap` markers
+        (keep their children). Used when re-emitting buffered content inside
+        a new <ins>/<del> wrapper, where nested markers would be invalid.
+        """
+        out = []
+        depth = 0
+        for ev in events:
+            etype, data, pos = ev
+            if etype == START and qname_localname(data[0]) == drop:
+                depth += 1
+                continue
+            if etype == END and qname_localname(data) == drop:
+                if depth:
+                    depth -= 1
+                continue
+            if depth:
+                continue
+            if etype == START and qname_localname(data[0]) == unwrap:
+                continue
+            if etype == END and qname_localname(data) == unwrap:
+                continue
+            out.append(ev)
+        return out
+
     def leave(self, pos, tag):
         if not self._stack:
             return False
@@ -362,6 +390,14 @@ class StreamDiffer(object):
                 old_style = buf['old_style']
                 diff_id = buf['diff_id']
 
+                # The buffer may itself contain <ins>/<del> markers when the
+                # content changed along with the style. Nesting them inside the
+                # wrappers below is invalid (accept/reject would misfire), so
+                # emit the old content in the <del> copy and the new content in
+                # the <ins> copy instead.
+                del_events = self._strip_change_markers(buffered, drop='ins', unwrap='del')
+                ins_events = self._strip_change_markers(buffered, drop='del', unwrap='ins')
+
                 # Emit del with old style
                 del_attrs = Attrs()
                 if old_style:
@@ -370,7 +406,7 @@ class StreamDiffer(object):
                     inner_id = self._new_diff_id()
                     del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), inner_id)]
                 self.append(START, (QName('del'), del_attrs), (None, -1, -1))
-                for ev in buffered:
+                for ev in del_events:
                     self.append(*ev)
                 self.append(END, QName('del'), (None, -1, -1))
 
@@ -380,7 +416,7 @@ class StreamDiffer(object):
                     ins_id = self._new_diff_id()
                     ins_attrs = ins_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), ins_id)]
                 self.append(START, (QName('ins'), ins_attrs), (None, -1, -1))
-                for ev in buffered:
+                for ev in ins_events:
                     self.append(*ev)
                 self.append(END, QName('ins'), (None, -1, -1))
 
@@ -1588,6 +1624,7 @@ class StreamDiffer(object):
             self.process()
         if getattr(self.config, 'merge_adjacent_change_tags', True):
             self._result = merge_adjacent_change_tags(self._result, config=self.config)
+        self._result = normalize_void_element_events(self._result)
         return Stream(self._result)
 
 

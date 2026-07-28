@@ -14,7 +14,7 @@ from .utils import qname_localname
 from .text_differ import mark_text
 
 
-def handle_start_event(differ, tag, attrs, pos):
+def handle_start_event(differ, tag, attrs, pos, block_end_in_slice=True):
     """Handle START events within block_process."""
     lname = qname_localname(tag)
     # Visualize <br> changes explicitly
@@ -59,8 +59,18 @@ def handle_start_event(differ, tag, attrs, pos):
     # Wrap block wrappers (p, h1, etc.) so the whole element is deleted/inserted.
     # This prevents "empty tags" remaining after accept/reject (e.g. <p><del>...</del></p> -> <p></p>).
     if lname in BLOCK_WRAPPER_TAGS and differ._context in ('ins', 'del'):
+        # The wrapper opened below can only be closed by this block's END event.
+        # If the change range ends mid-block (edit crossing a </p><p> boundary),
+        # that END never arrives in this slice: the wrapper stays open across
+        # subsequent opcodes and swallows unchanged text and later <ins>/<del>
+        # markers (nested ins-in-del => content loss on accept). In that case
+        # enter the block unwrapped and let inner text runs be marked one by one.
+        if not block_end_in_slice:
+            differ.enter(pos, tag, attrs)
+            return True
+
         change_tag = QName(differ._context)
-        
+
         # Special Check: Are we inserting/deleting a block element directly inside a List?
         # e.g. <ul><del><p>...</p></del></ul> is invalid. It should be <ul><li><del><p>...</p></del></li></ul>.
         # Convert context-less blocks into proper list items if needed.
@@ -141,13 +151,39 @@ def handle_text_event(differ, data, pos):
     differ.append(TEXT, data, pos)
 
 
+def _unbalanced_block_starts(events):
+    """
+    Indexes of block-wrapper START events whose matching END is not in `events`
+    (i.e. the range ends inside the block). Those must not get an outer
+    <ins>/<del> wrapper, since nothing in the slice would ever close it.
+    """
+    stacks = {}
+    for i, (event_type, data, _pos) in enumerate(events):
+        if event_type == START:
+            lname = qname_localname(data[0])
+            if lname in BLOCK_WRAPPER_TAGS:
+                stacks.setdefault(lname, []).append(i)
+        elif event_type == END:
+            lname = qname_localname(data)
+            if lname in BLOCK_WRAPPER_TAGS:
+                stack = stacks.get(lname)
+                if stack:
+                    stack.pop()
+    unbalanced = set()
+    for stack in stacks.values():
+        unbalanced.update(stack)
+    return unbalanced
+
+
 def block_process(differ, events):
     """Process block-level events."""
-    for event in events:
+    unbalanced = _unbalanced_block_starts(events) if differ._context in ('ins', 'del') else ()
+    for i, event in enumerate(events):
         event_type, data, pos = event
         if event_type == START:
             tag, attrs = data
-            if handle_start_event(differ, tag, attrs, pos):
+            if handle_start_event(differ, tag, attrs, pos,
+                                  block_end_in_slice=(i not in unbalanced)):
                 continue
         elif event_type == END:
             if handle_end_event(differ, data, pos):
