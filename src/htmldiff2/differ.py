@@ -1126,13 +1126,11 @@ class StreamDiffer(object):
                                 self.append(*ev)
                             self.append(END, QName('del'), (None, -1, -1))
 
-                            # Emit <ol/ul class="tagdiff_added">
                             list_qname = list_start_ev[1][0]
                             list_attrs = list_start_ev[1][1]
                             list_attrs = self.inject_class(list_attrs, 'tagdiff_added')
                             if diff_id:
                                 list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-                            self.enter(list_start_ev[2], list_qname, list_attrs)
 
                             # Build old sentence lookup for inner diffing.
                             # Extract text from old p atoms (splitting multi-sentence <p> at <br/>)
@@ -1236,6 +1234,96 @@ class StreamDiffer(object):
                                     if best_txt.strip() != ntxt.strip():
                                         li_matched[li_idx] = best_txt
 
+                            # This region is consumed whole: anything in it that is
+                            # neither a new <li> nor the hidden revert payload
+                            # must be emitted here or it is lost from the view.
+                            # Two things used to vanish that way: new non-list
+                            # blocks beside the list (a heading, a rewritten
+                            # paragraph), and old sentences no <li> matched (a
+                            # whole dropped item, a paragraph replaced by an
+                            # unrelated list), which had nothing struck through.
+                            region_blocks = []
+                            list_start_nj = None
+                            seen_nj = set()
+                            for rj1, rj2 in sorted({(r[4], r[5]) for r in bullet_equal_ranges} | {(j1, j2)}):
+                                for nj in range(rj1, rj2):
+                                    if nj in seen_nj:
+                                        continue
+                                    seen_nj.add(nj)
+                                    natom = self._new_atoms[nj]
+                                    nevs = natom.get('events', [])
+                                    if (list_start_nj is None and len(nevs) == 1 and nevs[0][0] == START
+                                            and qname_localname(nevs[0][1][0]) in ('ol', 'ul')):
+                                        list_start_nj = nj
+                                    elif natom.get('kind') == 'block' and natom.get('tag') != 'li':
+                                        region_blocks.append((nj, natom))
+
+                            def _atom_text(atom):
+                                return ''.join(e[1] for e in atom.get('events', []) if e[0] == TEXT)
+
+                            region_new_texts = list(li_texts) + [_atom_text(a) for _, a in region_blocks]
+                            region_new_texts.append(' '.join(region_new_texts))
+                            old_sentence_keys = {tuple(_compare_words(otxt)) for otxt, _ in old_sentences}
+                            diff_id_attr = getattr(self.config, 'diff_id_attr', 'data-diff-id')
+                            own_ids = {}
+
+                            def _own_attrs(css_class):
+                                # Own class and diff id: an adjacent change tag
+                                # sharing neither would be merged into this one.
+                                attrs = Attrs([(QName('class'), css_class)])
+                                if diff_id:
+                                    if css_class not in own_ids:
+                                        own_ids[css_class] = self._new_diff_id()
+                                    attrs = attrs | [(QName(diff_id_attr), own_ids[css_class])]
+                                return attrs
+
+                            def _emit_region_block(atom):
+                                events = atom.get('events', [])
+                                if tuple(_compare_words(_atom_text(atom))) in old_sentence_keys:
+                                    for ev in events:
+                                        self.append(*ev)
+                                    return
+                                self.append(START, (QName('ins'), _own_attrs('structural-added')), (None, -1, -1))
+                                for ev in events:
+                                    self.append(*ev)
+                                self.append(END, QName('ins'), (None, -1, -1))
+
+                            used_old_texts = {old_sentences[oi][0].strip() for oi in old_used}
+                            li_is_new = {
+                                li_idx for li_idx, ntxt in enumerate(li_texts)
+                                if li_idx not in li_matched
+                                and ntxt.strip() not in used_old_texts
+                                and not any(_containment(otxt, ntxt) >= _TRUNCATION_COVERAGE
+                                            for otxt, _ in old_sentences)
+                            }
+
+                            for nj, natom in region_blocks:
+                                if list_start_nj is None or nj < list_start_nj:
+                                    _emit_region_block(natom)
+
+                            # Checked against every block of the new document, not
+                            # just this region: the model may have kept the wording
+                            # in a block this region does not render, and striking
+                            # it would claim a removal that never happened.
+                            document_new_texts = [
+                                _atom_text(a) for a in self._new_atoms if a.get('kind') == 'block'
+                            ]
+                            for oi, (otxt, _) in enumerate(old_sentences):
+                                if oi in old_used:
+                                    continue
+                                if not any(ch.isalpha() for ch in otxt):
+                                    continue
+                                if max(_containment(cand, otxt) for cand in region_new_texts + document_new_texts) >= _TRUNCATION_COVERAGE:
+                                    continue
+                                self.append(START, (QName('del'), _own_attrs('structural-removed')), (None, -1, -1))
+                                self.append(START, (QName('p'), Attrs()), (None, -1, -1))
+                                self.append(TEXT, otxt, (None, -1, -1))
+                                self.append(END, QName('p'), (None, -1, -1))
+                                self.append(END, QName('del'), (None, -1, -1))
+
+                            # Emit <ol/ul class="tagdiff_added">
+                            self.enter(list_start_ev[2], list_qname, list_attrs)
+
                             # Emit each <li class="diff-bullet-ins">
                             for li_idx, li_atom in enumerate(new_li_atoms):
                                 li_evs = li_atom.get('events', [])
@@ -1294,6 +1382,13 @@ class StreamDiffer(object):
                                                     self.append(TEXT, ' '.join(new_words[wj1:wj2]), (None, -1, -1))
                                                     self.append(END, QName('ins'), (None, -1, -1))
                                                     self.append(TEXT, ' ', (None, -1, -1))
+                                    elif li_idx in li_is_new:
+                                        # Wording found in no old sentence: mark
+                                        # it as added, or it reads as untouched.
+                                        self.append(START, (QName('ins'), _own_attrs('structural-added')), (None, -1, -1))
+                                        for ev in li_evs[1:-1]:
+                                            self.append(*ev)
+                                        self.append(END, QName('ins'), (None, -1, -1))
                                     else:
                                         # No change or no match — emit text as-is
                                         for ev in li_evs[1:-1]:
@@ -1302,6 +1397,10 @@ class StreamDiffer(object):
 
                             # Close ol/ul
                             self.leave((None, -1, -1), list_qname)
+
+                            for nj, natom in region_blocks:
+                                if list_start_nj is not None and nj > list_start_nj:
+                                    _emit_region_block(natom)
 
                         k = scan_k
                         continue
