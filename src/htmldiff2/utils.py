@@ -292,3 +292,47 @@ def merge_adjacent_change_tags(events, merge_tags=('ins', 'del'), config=None):
 
 
 
+
+VOID_TAGS = frozenset(['br', 'hr', 'img', 'input', 'area', 'base', 'col',
+                       'embed', 'source', 'track', 'wbr'])
+
+
+def normalize_void_element_events(events):
+    """
+    Keep void elements (br, img, ...) balanced and self-contained in the stream.
+
+    Diff bookkeeping (_skip_end_for / slice boundaries) can separate a void
+    element's START from its END or drop one of them. Genshi's serializer needs
+    balanced pairs: an unmatched void START swallows the next real end tag, and
+    a stray void END renders as a literal </br> (which browsers parse as an
+    extra <br>). Ensure every void START is immediately followed by its END and
+    drop any END without a pending START.
+    """
+    out = []
+    open_voids = []
+    i = 0
+    n = len(events)
+    while i < n:
+        etype, data, pos = events[i]
+        if etype == START:
+            tag = data[0]
+            if qname_localname(tag) in VOID_TAGS:
+                out.append((etype, data, pos))
+                if i + 1 < n and events[i + 1][0] == END and events[i + 1][1] == tag:
+                    out.append(events[i + 1])
+                    i += 2
+                else:
+                    out.append((END, tag, pos))
+                    open_voids.append(tag)
+                    i += 1
+                continue
+        elif etype == END and qname_localname(data) in VOID_TAGS:
+            # Only allowed as the (already handled) adjacent pair; a far END is
+            # either the auto-closed leftover of a pending START or an orphan.
+            if data in open_voids:
+                open_voids.remove(data)
+            i += 1
+            continue
+        out.append((etype, data, pos))
+        i += 1
+    return out

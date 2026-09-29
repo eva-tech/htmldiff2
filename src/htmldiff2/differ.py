@@ -2,6 +2,8 @@
 
 from __future__ import with_statement
 
+import re
+import unicodedata
 from difflib import SequenceMatcher
 from contextlib import contextmanager
 from genshi.core import Stream, QName, Attrs, START, END, TEXT
@@ -12,7 +14,8 @@ from .utils import (
     extract_text_from_events, raw_text_from_events, concat_events,
     longest_common_prefix_len, longest_common_suffix_len,
     has_visual_attrs, attrs_signature, structure_signature,
-    merge_adjacent_change_tags, events_equal_normalized
+    merge_adjacent_change_tags, events_equal_normalized,
+    normalize_void_element_events
 )
 from .atomization import atomize_events
 from .normalization import (
@@ -35,6 +38,101 @@ from .visual_replace import (
     try_inline_wrapper_to_plain
 )
 from .text_differ import mark_text, diff_text
+
+
+# Literal item numbering inside a paragraph: "1. ", "2) ", written by hand
+# instead of using a real list. Only split on a number that starts the segment
+# or follows sentence-ending punctuation, so "de 17,9 mm" and a decimal inside a
+# sentence are never treated as an item boundary.
+_TEXT_NUMBERING = re.compile(r'(?:(?<=^)|(?<=[.;:]\s)|(?<=[.;:]))\s*\d+\s*[.)]\s+')
+
+# Splitting a segment that holds only one item would just strip its number and
+# gain nothing, so require at least this many to treat it as a numbered run.
+_MIN_TEXT_NUMBERED_ITEMS = 2
+
+
+# Punctuation that only ever sits at a word edge. Stripped before comparing so
+# "medio," and "medio." are the same word.
+_EDGE_PUNCTUATION = '.,;:()[]\u00ab\u00bb"\''
+
+# How much of a new item's wording must already appear in an old sentence before
+# a shorter new item counts as that sentence truncated rather than a different
+# one. High enough that unrelated items are not paired up.
+_TRUNCATION_COVERAGE = 0.8
+
+
+def _compare_words(text):
+    """Word list for comparison only: case, accents and edge punctuation removed.
+
+    Rewriting an item rarely reproduces it character for character -- a comma
+    becomes a full stop, an accent is added or corrected. Comparing raw tokens
+    makes each of those count as a whole word changed, which on a short item is
+    enough to push a real truncation under the threshold and leave the dropped
+    wording unmarked. Only the comparison is normalized; the text emitted in the
+    diff is untouched.
+
+    Args:
+        text: Sentence or item text.
+
+    Returns:
+        list: Normalized words, punctuation-only tokens dropped.
+    """
+    folded = unicodedata.normalize('NFKD', text.lower())
+    folded = ''.join(c for c in folded if not unicodedata.combining(c))
+    words = (w.strip(_EDGE_PUNCTUATION) for w in folded.split())
+    return [w for w in words if w]
+
+
+def _containment(old_text, new_text):
+    """Fraction of ``new_text``'s words that also appear, in order, in ``old_text``.
+
+    1.0 means the new text is entirely contained in the old one, which is what a
+    truncation looks like. A rewrite that also inserts a word or two scores
+    slightly below that rather than failing outright.
+
+    Args:
+        old_text: Sentence from the original block.
+        new_text: Text of the candidate replacement item.
+
+    Returns:
+        float: Containment in the range 0.0 to 1.0.
+    """
+    old_words = _compare_words(old_text)
+    new_words = _compare_words(new_text)
+    if not new_words:
+        return 0.0
+    matched = sum(
+        block.size
+        for block in SequenceMatcher(None, old_words, new_words).get_matching_blocks()
+    )
+    return matched / len(new_words)
+
+
+def _split_text_numbering(old_sentences):
+    """Split old sentences that carry literal item numbering into one per item.
+
+    ``old_sentences`` holds ``(text, events)`` pairs. Only entries with no
+    events are split: those carry plain text, so re-deriving their boundaries is
+    safe, whereas an entry backed by events maps to real markup that must stay
+    intact.
+
+    Args:
+        old_sentences: Sentences collected from the old block.
+
+    Returns:
+        list: The same sentences, with numbered runs broken into single items.
+    """
+    split = []
+    for text, events in old_sentences:
+        if events is not None:
+            split.append((text, events))
+            continue
+        parts = [p.strip() for p in _TEXT_NUMBERING.split(text) if p and p.strip()]
+        if len(parts) >= _MIN_TEXT_NUMBERED_ITEMS:
+            split.extend((part, None) for part in parts)
+        else:
+            split.append((text, events))
+    return split
 
 
 def diff_genshi_stream(old_stream, new_stream):
@@ -351,6 +449,33 @@ class StreamDiffer(object):
         self._stack.append(tag)
         self.append(START, (tag, attrs), pos)
 
+    def _strip_change_markers(self, events, drop, unwrap):
+        """
+        Reduce an already-diffed event stream to one side of the change:
+        remove `drop` marker subtrees entirely and unwrap `unwrap` markers
+        (keep their children). Used when re-emitting buffered content inside
+        a new <ins>/<del> wrapper, where nested markers would be invalid.
+        """
+        out = []
+        depth = 0
+        for ev in events:
+            etype, data, pos = ev
+            if etype == START and qname_localname(data[0]) == drop:
+                depth += 1
+                continue
+            if etype == END and qname_localname(data) == drop:
+                if depth:
+                    depth -= 1
+                continue
+            if depth:
+                continue
+            if etype == START and qname_localname(data[0]) == unwrap:
+                continue
+            if etype == END and qname_localname(data) == unwrap:
+                continue
+            out.append(ev)
+        return out
+
     def leave(self, pos, tag):
         if not self._stack:
             return False
@@ -362,6 +487,14 @@ class StreamDiffer(object):
                 old_style = buf['old_style']
                 diff_id = buf['diff_id']
 
+                # The buffer may itself contain <ins>/<del> markers when the
+                # content changed along with the style. Nesting them inside the
+                # wrappers below is invalid (accept/reject would misfire), so
+                # emit the old content in the <del> copy and the new content in
+                # the <ins> copy instead.
+                del_events = self._strip_change_markers(buffered, drop='ins', unwrap='del')
+                ins_events = self._strip_change_markers(buffered, drop='del', unwrap='ins')
+
                 # Emit del with old style
                 del_attrs = Attrs()
                 if old_style:
@@ -370,7 +503,7 @@ class StreamDiffer(object):
                     inner_id = self._new_diff_id()
                     del_attrs = del_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), inner_id)]
                 self.append(START, (QName('del'), del_attrs), (None, -1, -1))
-                for ev in buffered:
+                for ev in del_events:
                     self.append(*ev)
                 self.append(END, QName('del'), (None, -1, -1))
 
@@ -380,7 +513,7 @@ class StreamDiffer(object):
                     ins_id = self._new_diff_id()
                     ins_attrs = ins_attrs | [(QName(getattr(self.config, 'diff_id_attr', 'data-diff-id')), ins_id)]
                 self.append(START, (QName('ins'), ins_attrs), (None, -1, -1))
-                for ev in buffered:
+                for ev in ins_events:
                     self.append(*ev)
                 self.append(END, QName('ins'), (None, -1, -1))
 
@@ -993,13 +1126,11 @@ class StreamDiffer(object):
                                 self.append(*ev)
                             self.append(END, QName('del'), (None, -1, -1))
 
-                            # Emit <ol/ul class="tagdiff_added">
                             list_qname = list_start_ev[1][0]
                             list_attrs = list_start_ev[1][1]
                             list_attrs = self.inject_class(list_attrs, 'tagdiff_added')
                             if diff_id:
                                 list_attrs = self._set_attr(list_attrs, getattr(self.config, 'diff_id_attr', 'data-diff-id'), diff_id)
-                            self.enter(list_start_ev[2], list_qname, list_attrs)
 
                             # Build old sentence lookup for inner diffing.
                             # Extract text from old p atoms (splitting multi-sentence <p> at <br/>)
@@ -1036,6 +1167,16 @@ class StreamDiffer(object):
                                     if stxt:
                                         old_sentences.append((stxt, None))
 
+                            # A <p> may number its items as literal text
+                            # ("1. ... 2. ... 3. ...") with no <br/> between
+                            # them, which is exactly the shape being upgraded to
+                            # a real list. Splitting only at <br/> leaves all of
+                            # them as one sentence, so no old sentence lines up
+                            # with any single new <li> and every item is emitted
+                            # unmarked. Split those segments on their numbering
+                            # so each item can be matched and diffed.
+                            old_sentences = _split_text_numbering(old_sentences)
+
                             # Pre-compute matches: li_index → old_sentence_text
                             from difflib import SequenceMatcher as SM
                             li_texts = []
@@ -1061,26 +1202,127 @@ class StreamDiffer(object):
                                     if best_txt.strip() != ntxt.strip():
                                         li_matched[li_idx] = best_txt
 
-                            # Pass 2: spelling correction matches (ratio >= 0.5)
-                            # with length guard to reject multi-sentence → single sentence matches
+                            # Pass 2: spelling correction matches (ratio >= 0.5),
+                            # plus truncations of a single old sentence.
                             for li_idx, ntxt in enumerate(li_texts):
                                 if li_idx in li_matched or ntxt in [otxt for oi, (otxt, _) in enumerate(old_sentences) if oi in old_used]:
                                     continue
                                 best_idx, best_ratio, best_txt = None, 0.0, None
+                                best_cov = 0.0
                                 nword_count = len(ntxt.split())
                                 for oi, (otxt, _) in enumerate(old_sentences):
                                     if oi in old_used:
                                         continue
-                                    # Skip if old sentence has >1.5x words (multi-sentence block)
-                                    if len(otxt.split()) > nword_count * 1.5:
+                                    # A much longer old sentence is normally a
+                                    # multi-sentence block that must not collapse
+                                    # onto one new item. But it is also what a
+                                    # truncation looks like -- the model kept the
+                                    # opening and dropped the rest -- and skipping
+                                    # those emitted the item with no <del>, so the
+                                    # removed wording vanished silently. Keep the
+                                    # guard only when the new text is not largely
+                                    # contained in the old one.
+                                    cov = _containment(otxt, ntxt)
+                                    if len(otxt.split()) > nword_count * 1.5 and cov < _TRUNCATION_COVERAGE:
                                         continue
                                     r = SM(None, otxt.lower(), ntxt.lower()).ratio()
                                     if r > best_ratio:
                                         best_ratio, best_idx, best_txt = r, oi, otxt
-                                if best_idx is not None and best_ratio >= 0.5:
+                                        best_cov = cov
+                                if best_idx is not None and (best_ratio >= 0.5 or best_cov >= _TRUNCATION_COVERAGE):
                                     old_used.add(best_idx)
                                     if best_txt.strip() != ntxt.strip():
                                         li_matched[li_idx] = best_txt
+
+                            # This region is consumed whole: anything in it that is
+                            # neither a new <li> nor the hidden revert payload
+                            # must be emitted here or it is lost from the view.
+                            # Two things used to vanish that way: new non-list
+                            # blocks beside the list (a heading, a rewritten
+                            # paragraph), and old sentences no <li> matched (a
+                            # whole dropped item, a paragraph replaced by an
+                            # unrelated list), which had nothing struck through.
+                            region_blocks = []
+                            list_start_nj = None
+                            seen_nj = set()
+                            for rj1, rj2 in sorted({(r[4], r[5]) for r in bullet_equal_ranges} | {(j1, j2)}):
+                                for nj in range(rj1, rj2):
+                                    if nj in seen_nj:
+                                        continue
+                                    seen_nj.add(nj)
+                                    natom = self._new_atoms[nj]
+                                    nevs = natom.get('events', [])
+                                    if (list_start_nj is None and len(nevs) == 1 and nevs[0][0] == START
+                                            and qname_localname(nevs[0][1][0]) in ('ol', 'ul')):
+                                        list_start_nj = nj
+                                    elif natom.get('kind') == 'block' and natom.get('tag') != 'li':
+                                        region_blocks.append((nj, natom))
+
+                            def _atom_text(atom):
+                                return ''.join(e[1] for e in atom.get('events', []) if e[0] == TEXT)
+
+                            region_new_texts = list(li_texts) + [_atom_text(a) for _, a in region_blocks]
+                            region_new_texts.append(' '.join(region_new_texts))
+                            old_sentence_keys = {tuple(_compare_words(otxt)) for otxt, _ in old_sentences}
+                            diff_id_attr = getattr(self.config, 'diff_id_attr', 'data-diff-id')
+                            own_ids = {}
+
+                            def _own_attrs(css_class):
+                                # Own class and diff id: an adjacent change tag
+                                # sharing neither would be merged into this one.
+                                attrs = Attrs([(QName('class'), css_class)])
+                                if diff_id:
+                                    if css_class not in own_ids:
+                                        own_ids[css_class] = self._new_diff_id()
+                                    attrs = attrs | [(QName(diff_id_attr), own_ids[css_class])]
+                                return attrs
+
+                            def _emit_region_block(atom):
+                                events = atom.get('events', [])
+                                if tuple(_compare_words(_atom_text(atom))) in old_sentence_keys:
+                                    for ev in events:
+                                        self.append(*ev)
+                                    return
+                                self.append(START, (QName('ins'), _own_attrs('structural-added')), (None, -1, -1))
+                                for ev in events:
+                                    self.append(*ev)
+                                self.append(END, QName('ins'), (None, -1, -1))
+
+                            used_old_texts = {old_sentences[oi][0].strip() for oi in old_used}
+                            li_is_new = {
+                                li_idx for li_idx, ntxt in enumerate(li_texts)
+                                if li_idx not in li_matched
+                                and ntxt.strip() not in used_old_texts
+                                and not any(_containment(otxt, ntxt) >= _TRUNCATION_COVERAGE
+                                            for otxt, _ in old_sentences)
+                            }
+
+                            for nj, natom in region_blocks:
+                                if list_start_nj is None or nj < list_start_nj:
+                                    _emit_region_block(natom)
+
+                            # Checked against every block of the new document, not
+                            # just this region: the model may have kept the wording
+                            # in a block this region does not render, and striking
+                            # it would claim a removal that never happened.
+                            document_new_texts = [
+                                _atom_text(a) for a in self._new_atoms if a.get('kind') == 'block'
+                            ]
+                            for oi, (otxt, _) in enumerate(old_sentences):
+                                if oi in old_used:
+                                    continue
+                                if not any(ch.isalpha() for ch in otxt):
+                                    continue
+                                if max(_containment(cand, otxt) for cand in region_new_texts + document_new_texts) >= _TRUNCATION_COVERAGE:
+                                    continue
+                                self.append(START, (QName('del'), _own_attrs('structural-removed')), (None, -1, -1))
+                                self.append(START, (QName('p'), Attrs()), (None, -1, -1))
+                                self.append(TEXT, otxt, (None, -1, -1))
+                                self.append(END, QName('p'), (None, -1, -1))
+                                self.append(END, QName('del'), (None, -1, -1))
+
+                            # Emit <ol/ul class="tagdiff_added">
+                            self.enter(list_start_ev[2], list_qname, list_attrs)
 
                             # Emit each <li class="diff-bullet-ins">
                             for li_idx, li_atom in enumerate(new_li_atoms):
@@ -1140,6 +1382,13 @@ class StreamDiffer(object):
                                                     self.append(TEXT, ' '.join(new_words[wj1:wj2]), (None, -1, -1))
                                                     self.append(END, QName('ins'), (None, -1, -1))
                                                     self.append(TEXT, ' ', (None, -1, -1))
+                                    elif li_idx in li_is_new:
+                                        # Wording found in no old sentence: mark
+                                        # it as added, or it reads as untouched.
+                                        self.append(START, (QName('ins'), _own_attrs('structural-added')), (None, -1, -1))
+                                        for ev in li_evs[1:-1]:
+                                            self.append(*ev)
+                                        self.append(END, QName('ins'), (None, -1, -1))
                                     else:
                                         # No change or no match — emit text as-is
                                         for ev in li_evs[1:-1]:
@@ -1148,6 +1397,10 @@ class StreamDiffer(object):
 
                             # Close ol/ul
                             self.leave((None, -1, -1), list_qname)
+
+                            for nj, natom in region_blocks:
+                                if list_start_nj is not None and nj > list_start_nj:
+                                    _emit_region_block(natom)
 
                         k = scan_k
                         continue
@@ -1588,6 +1841,7 @@ class StreamDiffer(object):
             self.process()
         if getattr(self.config, 'merge_adjacent_change_tags', True):
             self._result = merge_adjacent_change_tags(self._result, config=self.config)
+        self._result = normalize_void_element_events(self._result)
         return Stream(self._result)
 
 
